@@ -1,0 +1,12 @@
+# Container only (Dockerfile): the CUDA 13.0 toolkit wheels FlashInfer's first-serve JIT compiles with.
+# The main lock (requirements-pinned.txt) resolves these to CUDA 13.4, whose PTX a driver older than
+# CUDA 13.4 rejects ("Unsupported .version"). The bare-metal route compiles with the system toolkit
+# (CUDA_HOME, default /usr/local/cuda) and never installs this file. Installed with --no-deps --require-hashes.
+nvidia-cuda-cccl==13.0.85 \
+    --hash=sha256:e0da7ad981f3a8aff08241b5bfc1af868742a63e2762f53a5171c492ef242649
+nvidia-cuda-crt==13.0.88 \
+    --hash=sha256:2c8043c7c9e02492716426e9919fc78d2c5b3b2a7a768a88e952676b08aa55a4
+nvidia-cuda-nvcc==13.0.88 \
+    --hash=sha256:56fe502eb77625a12f25172caa3cdddb4e4c8ba2c8c17dba44b164761b380f03
+nvidia-nvvm==13.0.88 \
+    --hash=sha256:c5f41ffeb6466944a026dfa5317d7d85355c119bbec279205d22f1869d1054e0

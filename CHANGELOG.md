@@ -20,3 +20,9 @@ First public release. There is no earlier public version and no upgrade path.
   (`--require-hashes`), patch markers asserted, `pip check`.
 - Checkpoint: `halt95/Qwen3.8-27B-W4A16-Merlin` (11 files, checksums in
   `release/checkpoint.sha256`).
+- Container recipe: `Dockerfile`, `docker-compose.yml`, `.dockerignore` and
+  `serve/docker-entrypoint.sh` build one image by `release/install-env.sh` and serve
+  `serve/serve.sh` (TP=2) or `serve/serve-tp4.sh` (TP=4), with the checkpoint mounted at
+  `/model` and compile caches in a `/cache` volume. Its first-serve toolkit is pinned to CUDA 13.0
+  (`release/requirements-container-toolkit.txt`), so any CUDA 13.0+ driver accepts the JIT kernels.
+  Built and its entrypoint checked on a host without GPUs; not yet run on GPUs inside a container.

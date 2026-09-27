@@ -1,0 +1,5 @@
+# Files read by Linux tools inside the container or on the serving host: LF only, whatever the checkout platform
+*.sh text eol=lf
+Dockerfile text eol=lf
+docker-compose.yml text eol=lf
+.dockerignore text eol=lf

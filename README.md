@@ -9,7 +9,8 @@ MTP head) served with vLLM at its **full 262,144-token context** on consumer Amp
   decode step time than dual card.
 
 It runs on **stock vLLM 0.30.0 from PyPI plus five Python patches**: nothing is compiled at install time, and every
-dependency is hash-locked. **v1.0.0** is the first public release. Validated on sm_86 (Ampere) only.
+dependency is hash-locked. **v1.0.0** is the first public release, for bare metal or a container
+([Quick start (container)](#quick-start-container)). Validated on sm_86 (Ampere) only.
 
 [![GPU](https://img.shields.io/badge/GPU-2x_or_4x_RTX_3090-76B900?logo=nvidia&logoColor=white)](#hardware)
 [![Context](https://img.shields.io/badge/context-262K_per_request-ffb000)](#the-kv-budget)
@@ -71,6 +72,86 @@ curl http://127.0.0.1:8100/v1/chat/completions \
 
 How to tell the server is healthy: [Check it's working](#check-its-working). Read
 [Known behaviours](#known-behaviours-of-qwen38-27b-in-vllm-030) before putting it in front of clients.
+
+## Quick start (container)
+
+One image, built by the same install route as the bare-metal quick start and serving the same command. The image has
+been built and its entrypoint checks run on a host without GPUs; GPU serving was verified on the bare-metal route, not
+yet inside the container. Host requirements:
+
+- Linux x86_64 with 2 or 4 RTX 3090s (24 GB each), headless, with working peer-to-peer (see [Requirements](#requirements)).
+  The KV pool is pinned in bytes for 24 GB cards; on other cards set `KV_BYTES=auto`.
+- An NVIDIA driver for CUDA 13.0 or newer ([Driver and toolkit](#driver-and-toolkit)).
+- `nvidia-container-toolkit` registered with Docker
+  (`sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker`).
+- Docker Compose v2 (`docker compose`, not the 1.x `docker-compose`), for the compose route.
+- About 9 GB of disk for the image, 17 GB for the checkpoint, and the host RAM from [Requirements](#requirements).
+
+```bash
+git clone --branch v1.0.0 https://github.com/halt95/qwen38-27b-3090s && cd qwen38-27b-3090s
+docker build -t qwen38-27b-3090s:v1.0.0 .      # the release's own install route, every wheel hash-checked
+hf download halt95/Qwen3.8-27B-W4A16-Merlin --local-dir /path/to/Qwen3.8-27B-W4A16-Merlin   # 17 GB
+MODEL_DIR=/path/to/Qwen3.8-27B-W4A16-Merlin docker compose up -d   # TP=2 on cards 0 and 1
+docker compose logs -f qwen38-27b      # wait for "Application startup complete" (first start ~7 min)
+curl -s localhost:8100/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"qwen38-27b","messages":[{"role":"user","content":"What is 17*23?"}],"max_tokens":512}'
+```
+
+`hf` is the Hugging Face CLI (`pipx install huggingface_hub`). The checkpoint is **mounted** at `/model`, never copied
+into the image; `.dockerignore` keeps the build context to the install and serve files, so a checkpoint inside the
+clone is not sent to Docker either. Check the checkpoint with `sha256sum -c release/checkpoint.sha256` from its directory.
+
+Without compose, TP=2 on the host's cards 0 and 1, or TP=4 on all four:
+
+```bash
+docker run -d --name qwen38-27b --gpus '"device=0,1"' --ipc=host --ulimit memlock=-1 --stop-timeout 70 \
+  -p 8100:8100 -v /path/to/Qwen3.8-27B-W4A16-Merlin:/model:ro -v qwen38-27b-cache:/cache qwen38-27b-3090s:v1.0.0
+docker run -d --name qwen38-27b --gpus all -e TP=4 --ipc=host --ulimit memlock=-1 --stop-timeout 70 \
+  -p 8100:8100 -v /path/to/Qwen3.8-27B-W4A16-Merlin:/model:ro -v qwen38-27b-cache:/cache qwen38-27b-3090s:v1.0.0
+```
+
+For TP=4 with compose, list four `device_ids` and set `TP: 4` in `docker-compose.yml`.
+
+- `--ipc=host` (or `--shm-size=8g`): tensor-parallel workers exchange data through `/dev/shm`; Docker's 64 MB default
+  is too small.
+- `--ulimit memlock=-1`: the host-resident embedding table is pinned host memory.
+- `--stop-timeout 70`: the server drains for up to 60 s on shutdown; Docker's 10 s default would kill it mid-drain.
+- The `/cache` volume keeps vLLM's compile cache and FlashInfer's and Triton's kernels. The first start compiles them
+  (about 7 minutes at TP=2 on the reference host); later starts reuse them.
+- The image sets `HF_HUB_OFFLINE=1` and the serve scripts turn vLLM usage statistics off, so the container neither
+  reports usage nor contacts the Hugging Face Hub.
+
+**Settings** are the serve scripts' own environment variables, passed with `-e` (or under `environment:` in compose):
+`TP` (`2` runs `serve/serve.sh`, `4` runs `serve/serve-tp4.sh`), `PORT` (8100), `SERVED` (`qwen38-27b`), `GPUS` (card
+indices **inside** the container), `KV_BYTES` (`auto` drops the pin), `SPEC_K` (1 or 3), `LPT` (`0` turns it off),
+`CHAT_TEMPLATE` (empty uses the checkpoint's own), `THINKING` and `VLLM_API_KEY`. The serve scripts take no extra vLLM
+arguments; for a shell in the image use `docker run --rm -it --entrypoint bash qwen38-27b-3090s:v1.0.0`.
+
+The endpoint has no API key and publishes port 8100 on every interface. If the host is reachable from other machines,
+set `VLLM_API_KEY` (clients then send `Authorization: Bearer <key>`), or publish `127.0.0.1:8100:8100` behind a proxy.
+The image's `HEALTHCHECK` runs a one-token generation, not `/v1/models`, which keeps answering after the engine has
+died: `docker inspect --format '{{.State.Health.Status}}' qwen38-27b`.
+
+### Driver and toolkit
+
+vLLM compiles nothing at build time, but the **first serve** compiles FlashInfer's kernels with `nvcc` and Triton's
+launchers with `gcc`. The image carries both: gcc/g++/ninja from Debian, and the CUDA 13.0 toolkit wheels from
+`release/requirements-container-toolkit.txt` (`CUDA_HOME` points at them), so any driver for CUDA 13.0 or newer
+accepts the kernels. A driver rejects kernels from an `nvcc` newer than the CUDA version it supports ("Unsupported
+.version"), so the entrypoint compares the two and refuses to start on a mismatch. Compare `nvidia-smi` ("CUDA
+Version") with:
+
+```bash
+docker run --rm --entrypoint nvcc qwen38-27b-3090s:v1.0.0 --version | tail -1
+```
+
+If the driver is older, upgrade it, or mount a CUDA toolkit no newer than the driver and point `CUDA_HOME` at it:
+`docker run ... -v /usr/local/cuda:/opt/host-cuda:ro -e CUDA_HOME=/opt/host-cuda ...`.
+
+The entrypoint's other messages: `checkpoint not found at /model` (the mount is missing or is not the directory with
+`config.json` and the `*.safetensors`); `WARNING: no NVIDIA GPU visible` (no `--gpus`, or the NVIDIA runtime is not
+registered); `TP=4 needs 4 GPUs but the container sees 2` (pass four cards). Everything the container does is in
+`Dockerfile`, `docker-compose.yml` and `serve/docker-entrypoint.sh`.
 
 ## Build and serve
 
@@ -520,8 +601,8 @@ calibration data is distributed. The 11 files are checksummed in `release/checkp
 
 ## What ships next
 
-In no fixed order: a single-card profile (soon TM); a quad card soak on v1.0.0; a runtime guard for patch 2 so it switches itself off outside sm_86 / FA2; a container recipe
-(not part of this release); and prefix-cache reuse of a previous turn's answer on this architecture.
+In no fixed order: a single-card profile (soon TM); a quad card soak on v1.0.0; a runtime guard for patch 2 so it switches itself off outside sm_86 / FA2;
+the container run on GPUs by us (so far built and checked on a host without GPUs); and prefix-cache reuse of a previous turn's answer on this architecture.
 
 ## Credit
 

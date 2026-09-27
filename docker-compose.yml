@@ -1,0 +1,37 @@
+# Qwen3.8-27B v1.0.0 with one command, from the repository root:
+#   MODEL_DIR=/path/to/checkpoint docker compose up -d
+# then talk to http://localhost:8100/v1 (OpenAI-compatible; model name "qwen38-27b").
+# The first start compiles the cudagraphs and FlashInfer's kernels into the qwen38-27b-cache volume (~7 min); later
+# starts reuse it. Needs Docker Compose v2 and nvidia-container-toolkit registered with Docker
+# (nvidia-ctk runtime configure --runtime=docker).
+services:
+  qwen38-27b:
+    image: qwen38-27b-3090s:v1.0.0
+    build:
+      context: .
+      dockerfile: Dockerfile
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0", "1"]    # TP=2; for TP=4 list four ids and set TP: 4 below
+              capabilities: [gpu]
+    ipc: host                           # tensor-parallel workers share memory through /dev/shm
+    ulimits:
+      memlock: -1                       # the host-resident embedding table is pinned host memory
+    ports:
+      - "8100:8100"                     # every interface, no API key: set VLLM_API_KEY below, or bind 127.0.0.1:8100:8100
+    environment:
+      TP: 2
+      # SERVED: "qwen38-27b"            # model name clients use
+      # SPEC_K: 3                       # MTP draft tokens (1 or 3)
+      # KV_BYTES: auto                  # drop the per-GPU KV pool pin (cards other than 24 GB)
+      # VLLM_API_KEY: ...               # set it and clients must send the same value as a Bearer token
+    volumes:
+      - "${MODEL_DIR:?set MODEL_DIR to the checkpoint directory}:/model:ro"
+      - qwen38-27b-cache:/cache
+    restart: unless-stopped
+    stop_grace_period: 70s              # serve passes --shutdown-timeout 60; Docker's 10 s default would kill a draining server
+volumes:
+  qwen38-27b-cache: {}

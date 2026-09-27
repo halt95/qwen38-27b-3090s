@@ -1,0 +1,15 @@
+# Allow-list: the build context is the repository root, but the image needs only the install and serve routes.
+# Everything else stays out of the context (and so out of the image), including a checkpoint downloaded into the
+# clone (*.safetensors would otherwise be sent to the Docker daemon).
+*
+!LICENSE
+!release/install-env.sh
+!release/requirements-pinned.txt
+!release/requirements-pip.txt
+!release/requirements-container-toolkit.txt
+!patches/vllm-0.30.0
+!serve
+**/__pycache__
+**/*.pyc
+**/*.bak*
+**/*.safetensors
