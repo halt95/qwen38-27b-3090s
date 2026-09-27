@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 16:29:00 +0000
+Subject: [PATCH 3/5] host-resident embedding table, on by default
+
+The token embedding is read once per token and never participates in
+attention, so it does not need to sit in VRAM. Moving it to pinned host
+memory and reading it through a device-mapped view frees 1.184 GiB per card
+at TP=2 on a 248,320 x 5,120 table (both the target and the MTP drafter
+tables are walked).
+
+ON BY DEFAULT, and the measurement behind that default was taken on PCIe
+Gen4 x16. The gather crosses the bus once per token, so a narrower or slower
+link is the case where this could cost rather than pay, and it has not been
+measured there. Set VLLM_HOST_EMBED_TABLE=0 to keep the table in VRAM.
+
+Freeing VRAM does not enlarge the pool on its own: raise --kv-cache-memory
+by the freed bytes to collect the benefit.
+
+Proof: "HOST-RESIDENT EMBED TABLE: freed X GiB of VRAM on this rank".
+---
+ envs.py                       |  6 ++++
+ v1/worker/gpu/model_runner.py | 61 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 67 insertions(+)
+
+diff --git a/envs.py b/envs.py
+index 4755637..287155a 100644
+--- a/envs.py
++++ b/envs.py
+@@ -123,6 +123,7 @@ if TYPE_CHECKING:
+     VLLM_FASTSAFETENSORS_QUEUE_SIZE: int = 0
+     VLLM_TRITON_FORCE_FIRST_CONFIG: bool = False
+     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
++    VLLM_HOST_EMBED_TABLE: bool = True
+     VLLM_FLASHINFER_PLAN_CACHE: bool = True
+     VLLM_SKIP_P2P_CHECK: bool = False
+     VLLM_DISABLED_KERNELS: list[str] = []
+@@ -1183,6 +1184,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # if might be helpful to set VLLM_SKIP_P2P_CHECK=0
+     # so that vLLM can verify if p2p is actually working.
+     # See https://github.com/vllm-project/vllm/blob/a9b15c606fea67a072416ea0ea115261a2756058/vllm/distributed/device_communicators/custom_all_reduce_utils.py#L101-L108 for details. # noqa
++    # --- host-resident embedding table ---
++    # Registered here rather than read through os.environ directly: an os.environ knob is
++    # NOT part of the torch AOT cache key, so a cached compile could silently ignore it
++    # On by default; VLLM_HOST_EMBED_TABLE=0 keeps the table in VRAM.
++    "VLLM_HOST_EMBED_TABLE": lambda: bool(int(os.getenv("VLLM_HOST_EMBED_TABLE", "1"))),
+     # --- FlashInfer decode-plan cache (fa2/sm_86) ---
+     # Single-entry cache that skips fast_decode_plan when the schedule cannot have
+     # changed. On by default; VLLM_FLASHINFER_PLAN_CACHE=0 disables it. Registered here
+diff --git a/v1/worker/gpu/model_runner.py b/v1/worker/gpu/model_runner.py
+index b66d552..ef14eca 100644
+--- a/v1/worker/gpu/model_runner.py
++++ b/v1/worker/gpu/model_runner.py
+@@ -184,6 +184,65 @@ from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
+ logger = init_logger(__name__)
+ 
+ 
++# --- host-resident embedding table ---
++def _host_embed_tables(runner) -> None:
++    """Move every embed_tokens table into pinned host RAM, read via a device-mapped view.
++
++    Walks the target model AND the drafter, because the MTP predictor allocates its own
++    VocabParallelEmbedding and merely loads the same checkpoint values into it.
++
++    Frees VRAM only. It does NOT raise the KV pool by itself: --kv-cache-memory is a hard pin,
++    so the freed memory sits idle until the pin is raised, which is a separate verified step.
++    """
++    import vllm.envs as envs
++
++    if not envs.VLLM_HOST_EMBED_TABLE:
++        return
++    import torch
++
++    from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
++
++    roots = []
++    m = getattr(runner, "model", None)
++    if m is not None:
++        roots.append(("target", m))
++    # V1 calls it `drafter`; V2 (the default runner) calls it `speculator`
++    for attr in ("drafter", "speculator"):
++        d = getattr(runner, attr, None)
++        dm = getattr(d, "model", None) if d is not None else None
++        if dm is not None and all(dm is not r for _, r in roots):
++            roots.append((attr, dm))
++
++    total = 0
++    n_tables = 0
++    for label, root in roots:
++        for name, mod in root.named_modules():
++            if not name.endswith("embed_tokens"):
++                continue
++            p = getattr(mod, "weight", None)
++            if p is None or getattr(p, "_vllm_is_uva_offloaded", False):
++                continue
++            if p.data.device.type != "cuda":
++                continue
++            nbytes = p.data.numel() * p.data.element_size()
++            cpu_data = p.data.to(device="cpu").pin_memory()
++            p.data = get_accelerator_view_from_cpu_tensor(cpu_data)
++            p._vllm_is_uva_offloaded = True
++            total += nbytes
++            n_tables += 1
++            logger.info(
++                "host-embed: %s/%s -> pinned host, %.3f GiB, shape %s",
++                label, name, nbytes / (1024 ** 3), tuple(p.data.shape))
++    if total:
++        torch.cuda.empty_cache()
++        logger.info(
++            "HOST-RESIDENT EMBED TABLE: freed %.3f GiB of VRAM on this rank "
++            "across %d table(s)", total / (1024 ** 3), n_tables)
++    else:
++        logger.warning(
++            "host-embed: VLLM_HOST_EMBED_TABLE is on but NO table was offloaded")
++
++
+ class GPUModelRunner(LoRAModelRunnerMixin):
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+         self.vllm_config = vllm_config
+@@ -422,6 +481,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     eplb_models_added = self.eplb.maybe_register_speculator(
+                         self.speculator, self.speculative_config, load_dummy_weights
+                     )
++            # --- host-resident embedding table ---
++            _host_embed_tables(self)
+         time_after_load = time.perf_counter()
+ 
+         self.model_memory_usage = m.consumed_memory
+-- 
+2.47.3
+

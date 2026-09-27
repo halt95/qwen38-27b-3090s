@@ -1,0 +1,201 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 12:00:00 +0000
+Subject: [PATCH 5/5] spec-decode: skip the seq_lens device sync on MTP draft
+ step >= 2
+
+Each MTP step makes three blocking seq_lens.cpu() calls in the FlashInfer
+metadata builder (target verify, draft step 1, draft step 2). The first two
+depend on the rejection count, which lives on the GPU. Draft step 2 does
+not: _update_draft_inputs_kernel sets it to draft step 1's lengths + 1 on
+every row, padded rows included (the FULL-graph draft decode replays an
+update kernel captured over the padded batch). This patch hands the builder
+those derived lengths, clamped to max_model_len, instead of syncing.
+
+Exactness: a verify mode (VLLM_DRAFT_SEQ_LENS_VERIFY=1) syncs anyway,
+compares and uses the synced value. 0 mismatches in 378 verified builds
+across c1 4K/32K, c8 and c32; a +1 failing control mismatched
+87/90 and 72/75. A live-rows-only derivation mismatched at c8/c32 on the
+padded rows, which is why every row is bumped.
+
+Measured on 2x3090 TP=2: c1 per-step ITL -1.5 to -1.8 % at
+4K/32K/131K (12/12 same-boot pairs negative); c8/c32 not worse.
+
+On by default. VLLM_DRAFT_SEQ_LENS_NOSYNC=0 disables it; both knobs are
+registered envs.py bools, so they are part of the compile cache key.
+
+Proof: "DRAFT SEQ_LENS NOSYNC ACTIVE: draft step 2 ..." once per rank.
+---
+ envs.py                                       | 12 +++++
+ v1/attention/backends/flashinfer.py           | 53 ++++++++++++++++++-
+ .../spec_decode/autoregressive/speculator.py  | 32 +++++++++++
+ 3 files changed, 95 insertions(+), 2 deletions(-)
+
+diff --git a/envs.py b/envs.py
+index ec8aa6a..127562b 100644
+--- a/envs.py
++++ b/envs.py
+@@ -126,6 +126,8 @@ if TYPE_CHECKING:
+     VLLM_HOST_EMBED_TABLE: bool = True
+     VLLM_FLASHINFER_PLAN_CACHE: bool = True
+     VLLM_GDN_BA_SPLITK: bool = True
++    VLLM_DRAFT_SEQ_LENS_NOSYNC: bool = True
++    VLLM_DRAFT_SEQ_LENS_VERIFY: bool = False
+     VLLM_SKIP_P2P_CHECK: bool = False
+     VLLM_DISABLED_KERNELS: list[str] = []
+     VLLM_USE_HW_AGNOSTIC: bool = False
+@@ -1201,6 +1203,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # default; VLLM_GDN_BA_SPLITK=0 keeps cuBLAS. Registered here (not read from
+     # os.environ) so it is part of the compile cache key.
+     "VLLM_GDN_BA_SPLITK": lambda: bool(int(os.getenv("VLLM_GDN_BA_SPLITK", "1"))),
++    # --- MTP draft-step seq_lens without a device sync ---
++    # Draft step >= 2 takes the previous draft build's CPU seq_lens + 1 instead of a
++    # blocking seq_lens.cpu(). On by default; VLLM_DRAFT_SEQ_LENS_NOSYNC=0 disables it.
++    # VLLM_DRAFT_SEQ_LENS_VERIFY=1 also syncs, compares, logs mismatches and uses the
++    # synced value (diagnostic; off by default). Registered here (not read from
++    # os.environ) so both are part of the compile cache key.
++    "VLLM_DRAFT_SEQ_LENS_NOSYNC": lambda: bool(
++        int(os.getenv("VLLM_DRAFT_SEQ_LENS_NOSYNC", "1"))),
++    "VLLM_DRAFT_SEQ_LENS_VERIFY": lambda: bool(
++        int(os.getenv("VLLM_DRAFT_SEQ_LENS_VERIFY", "0"))),
+     "VLLM_SKIP_P2P_CHECK": lambda: os.getenv("VLLM_SKIP_P2P_CHECK", "1") == "1",
+     # List of quantization kernels that should be disabled, used for testing
+     # and performance comparisons. Currently only affects MPLinearKernel
+diff --git a/v1/attention/backends/flashinfer.py b/v1/attention/backends/flashinfer.py
+index 48a4191..b3f9df8 100644
+--- a/v1/attention/backends/flashinfer.py
++++ b/v1/attention/backends/flashinfer.py
+@@ -100,6 +100,22 @@ FP4_DTYPE = torch.uint8
+ 
+ logger = init_logger(__name__)
+ 
++# --- MTP draft-step seq_lens without a device sync (VLLM_DRAFT_SEQ_LENS_NOSYNC) ---
++# Shared with the V2 autoregressive speculator. When enabled, every build that syncs
++# seq_lens keeps its CPU copy in "last"; for draft step >= 2 the speculator puts
++# last + 1 (what _update_draft_inputs_kernel does on the GPU, padded rows included) in
++# "next", and the next build takes it instead of calling seq_lens.cpu().
++_DRAFT_SEQ_LENS = {
++    "enabled": envs.VLLM_DRAFT_SEQ_LENS_NOSYNC,
++    "verify": envs.VLLM_DRAFT_SEQ_LENS_VERIFY,
++    "next": None,
++    "last": None,
++    "bypassed": 0,
++    "synced": 0,
++    "verified": 0,
++    "mismatch": 0,
++}
++
+ trtllm_workspace_buffer = None
+ 
+ 
+@@ -1430,8 +1446,41 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+         # (block_tables, seq_lens) directly.
+         needs_seq_lens_cpu = self.use_dcp or use_cascade or not all_uses_trtllm
+         if needs_seq_lens_cpu:
+-            with gpu_sync_allowed():
+-                seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
++            # --- MTP draft-step seq_lens without a device sync ---
++            _dsl = _DRAFT_SEQ_LENS
++            _dsl_next = _dsl["next"]
++            _dsl["next"] = None
++            if (
++                _dsl_next is not None
++                and _dsl_next.shape[0] == common_attn_metadata.seq_lens.shape[0]
++            ):
++                seq_lens_cpu = _dsl_next
++                _dsl["bypassed"] += 1
++                if _dsl["verify"]:
++                    with gpu_sync_allowed():
++                        _dsl_real = common_attn_metadata.seq_lens.cpu()
++                    _dsl["verified"] += 1
++                    if not torch.equal(_dsl_real, _dsl_next):
++                        _dsl["mismatch"] += 1
++                        if _dsl["mismatch"] <= 8:
++                            _dsl_d = (_dsl_real != _dsl_next).nonzero().flatten().tolist()
++                            logger.warning(
++                                "draft seq_lens MISMATCH #%d: n=%d rows %s real %s derived %s",
++                                _dsl["mismatch"], _dsl_real.shape[0], _dsl_d[:16],
++                                _dsl_real[_dsl_d[:16]].tolist(),
++                                _dsl_next[_dsl_d[:16]].tolist(),
++                            )
++                        seq_lens_cpu = _dsl_real
++                    if _dsl["verified"] == 1 or _dsl["verified"] % 1000 == 0:
++                        logger.info(
++                            "draft seq_lens verify: %d builds verified, %d mismatches",
++                            _dsl["verified"], _dsl["mismatch"])
++            else:
++                with gpu_sync_allowed():
++                    seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
++                _dsl["synced"] += 1
++            if _dsl["enabled"]:
++                _dsl["last"] = seq_lens_cpu
+         else:
+             seq_lens_cpu = None
+ 
+diff --git a/v1/worker/gpu/spec_decode/autoregressive/speculator.py b/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+index 3d243b6..0335b9b 100644
+--- a/v1/worker/gpu/spec_decode/autoregressive/speculator.py
++++ b/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+@@ -5,6 +5,7 @@ from typing import Any
+ import torch
+ import torch.nn as nn
+ 
++from vllm import envs
+ from vllm.config import VllmConfig
+ from vllm.config.compilation import CUDAGraphMode
+ from vllm.forward_context import BatchDescriptor, set_forward_context
+@@ -47,6 +48,17 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+         self.decode_cudagraph_manager: SpeculatorCudaGraphManager | None = None
+         self.use_fused_multi_step_decode = False
+ 
++        # --- MTP draft-step seq_lens without a device sync (VLLM_DRAFT_SEQ_LENS_NOSYNC) ---
++        # State shared with the FlashInfer metadata builder; None when off or unavailable.
++        self._draft_seq_lens = None
++        self._draft_seq_lens_fired = False
++        if envs.VLLM_DRAFT_SEQ_LENS_NOSYNC:
++            try:
++                from vllm.v1.attention.backends.flashinfer import _DRAFT_SEQ_LENS
++            except ImportError:
++                _DRAFT_SEQ_LENS = None
++            self._draft_seq_lens = _DRAFT_SEQ_LENS
++
+     def load_model(self, target_model: nn.Module) -> None:
+         super().load_model(target_model)
+         if not self.supports_mm_inputs:
+@@ -532,6 +544,23 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+                 slot_mappings_by_layer = build_slot_mappings_by_layer(
+                     slot_mappings, self.kv_cache_config
+                 )
++                # --- MTP draft-step seq_lens without a device sync ---
++                # Draft step >= 2: seq_lens = the previous draft build's CPU lengths + 1 on
++                # ALL rows (clamped to max_model_len). Padded rows included: in FULL-graph
++                # draft decode the captured update kernel runs over the padded batch.
++                _dsl = self._draft_seq_lens
++                if (
++                    _dsl is not None
++                    and step >= 2
++                    and self.advance_draft_positions
++                    and _dsl["last"] is not None
++                ):
++                    _dsl["next"] = torch.clamp(_dsl["last"] + 1, max=self.max_model_len)
++                    if not self._draft_seq_lens_fired:
++                        self._draft_seq_lens_fired = True
++                        logger.info(
++                            "DRAFT SEQ_LENS NOSYNC ACTIVE: draft step %d takes the previous "
++                            "build's CPU seq_lens + 1 (V2 speculator)", step)
+                 attn_metadata = self._build_uniform_attn_metadata(
+                     num_reqs=num_reqs,
+                     batch_desc=batch_desc,
+@@ -539,6 +568,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+                     seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+                     step=step,
+                 )
++                if _dsl is not None:
++                    # never hand a derived length to a later, non-draft build
++                    _dsl["next"] = None
+ 
+             self.current_draft_step.fill_(step)
+ 
+-- 
+2.47.3
+

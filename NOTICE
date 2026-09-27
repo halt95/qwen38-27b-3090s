@@ -1,0 +1,40 @@
+Qwen3.8-27B on RTX 3090s
+Copyright 2026 halt95
+
+This repository is licensed under the Apache License, Version 2.0 (see LICENSE).
+It contains, modifies or builds on the following third-party work.
+
+vLLM
+  https://github.com/vllm-project/vllm
+  License: Apache License 2.0. Copyright the vLLM project contributors.
+  patches/vllm-0.30.0/ modifies vLLM 0.30.0 source files (as published on PyPI) and adds one new
+  file, model_executor/layers/mamba/gdn/ba_splitk.py (SPDX-License-Identifier: Apache-2.0).
+
+vLLM pull request #47979 (author: lucifer1004)
+  https://github.com/vllm-project/vllm/pull/47979
+  An open draft upstream as of 2026-09-26. Patch 0001 ports part of it (uniform multi-token
+  decode with FlashInfer on Ampere) to vLLM 0.30.0. Apache License 2.0, as a contribution to vLLM.
+
+FlashInfer
+  https://github.com/flashinfer-ai/flashinfer
+  License: Apache License 2.0. Installed from PyPI as a dependency; not modified.
+
+compressed-tensors
+  https://github.com/vllm-project/compressed-tensors
+  License: Apache License 2.0. Installed from PyPI as a dependency; used by quant/ to pack the
+  int4 head and drafter codes; not modified.
+
+Qwen3.8-27B (base model, Qwen / Alibaba Cloud)
+  https://huggingface.co/Qwen/Qwen3.8-27B
+  License: Apache License 2.0.
+
+philbert's Qwen3.8-27B AWQ checkpoint (the base of halt95/Qwen3.8-27B-W4A16-Merlin)
+  https://huggingface.co/philbert440/Qwen3.8-27B-W4A16-AWQ
+  License: Apache License 2.0.
+
+froggeric's Qwen-Fixed-Chat-Templates, v22.5
+  https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates (release v22.5, commit 4ea21db9, 2026-09-03; fetched at revision 855bffc4)
+  License: Apache License 2.0 (declared by the source repository, inherited from Qwen).
+  Vendored unmodified: serve/templates/froggeric-qwen-v22.5.jinja
+  sha256: e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2
+  The underlying template is Qwen's (Alibaba Cloud), Apache-2.0. See serve/templates/NOTICE.

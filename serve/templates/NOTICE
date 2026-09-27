@@ -1,0 +1,6 @@
+froggeric-qwen-v22.5.jinja
+  Source:  https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates/resolve/855bffc49448e299789730ff92c9b8d834d6cc14/chat_template.jinja
+           (template_version "qwen3.8-froggeric-v22.5"; release commit 4ea21db9, 2026-09-03)
+  Licence: Apache-2.0 (declared by the source repository, "inherited from Qwen")
+  sha256:  e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2
+  Vendored unmodified. Credit: froggeric; the underlying template is Qwen's (Alibaba Cloud), Apache-2.0.

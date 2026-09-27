@@ -1,0 +1,172 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 12:00:00 +0000
+Subject: [PATCH 4/5] gdn: split-K GEMM for in_proj_ba at small token counts
+
+For the per-rank in_proj_ba at an MTP K=3 verify step (x[4, 5120] @
+W[48, 5120]^T at TP=2) cuBLAS on sm_86 picks a cutlass wmma kernel with a
+4-CTA grid: ~28 us idle, ~41 us in-server, x 48 GDN layers per decode step.
+A Triton split-K (S=16) takes 6.7 us. The op dispatches only at M <= 16;
+larger batches keep F.linear, where cuBLAS is already fast. Unquantized,
+bias-free in_proj_ba only (the gate-logit projection is never quantised).
+
+Measured on 2x3090 TP=2: c1 median ITL -1.25 ms at 4K (-5.9 %),
+-1.30 ms at 32K (-5.5 %), -1.05 ms at 250K (-3.0 %); flat at c8/c32.
+Not bit-identical to cuBLAS: the reduction order differs (fp32 accumulate).
+
+Validated on sm_86 only. On by default. VLLM_GDN_BA_SPLITK=0 disables it;
+the knob is a registered envs.py bool, so it is part of the compile cache key.
+
+Proof: "GDN in_proj_ba SPLIT-K ACTIVE: M=.. N=.. K=5120 S=16" once per rank.
+---
+ envs.py                                       |  6 ++
+ model_executor/layers/mamba/gdn/ba_splitk.py  | 73 +++++++++++++++++++
+ .../layers/mamba/gdn/qwen_gdn_linear_attn.py  | 14 +++-
+ 3 files changed, 92 insertions(+), 1 deletion(-)
+ create mode 100644 model_executor/layers/mamba/gdn/ba_splitk.py
+
+diff --git a/envs.py b/envs.py
+index 287155a..ec8aa6a 100644
+--- a/envs.py
++++ b/envs.py
+@@ -125,6 +125,7 @@ if TYPE_CHECKING:
+     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
+     VLLM_HOST_EMBED_TABLE: bool = True
+     VLLM_FLASHINFER_PLAN_CACHE: bool = True
++    VLLM_GDN_BA_SPLITK: bool = True
+     VLLM_SKIP_P2P_CHECK: bool = False
+     VLLM_DISABLED_KERNELS: list[str] = []
+     VLLM_USE_HW_AGNOSTIC: bool = False
+@@ -1195,6 +1196,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # (not read from os.environ) so it is part of the compile cache key.
+     "VLLM_FLASHINFER_PLAN_CACHE": lambda: bool(
+         int(os.getenv("VLLM_FLASHINFER_PLAN_CACHE", "1"))),
++    # --- GDN in_proj_ba split-K (sm_86, small M) ---
++    # Triton split-K GEMM for the unquantized GDN in_proj_ba at M <= 16 tokens. On by
++    # default; VLLM_GDN_BA_SPLITK=0 keeps cuBLAS. Registered here (not read from
++    # os.environ) so it is part of the compile cache key.
++    "VLLM_GDN_BA_SPLITK": lambda: bool(int(os.getenv("VLLM_GDN_BA_SPLITK", "1"))),
+     "VLLM_SKIP_P2P_CHECK": lambda: os.getenv("VLLM_SKIP_P2P_CHECK", "1") == "1",
+     # List of quantization kernels that should be disabled, used for testing
+     # and performance comparisons. Currently only affects MPLinearKernel
+diff --git a/model_executor/layers/mamba/gdn/ba_splitk.py b/model_executor/layers/mamba/gdn/ba_splitk.py
+new file mode 100644
+index 0000000..0c360c0
+--- /dev/null
++++ b/model_executor/layers/mamba/gdn/ba_splitk.py
+@@ -0,0 +1,73 @@
++# SPDX-License-Identifier: Apache-2.0
++# --- GDN in_proj_ba split-K (sm_86, small M) ---
++"""Split-K GEMM for the GDN in_proj_ba projection at small token counts.
++
++For x[M <= 16, 5120] @ W[48, 5120]^T (the per-rank in_proj_ba at TP=2 during an MTP K=3 verify
++step, M = 4) cuBLAS on sm_86 picks a cutlass wmma kernel with a 4-CTA grid: ~28 us on an idle
++3090, ~41 us in-server, x 48 GDN layers per step. Splitting K 16 ways fills the SMs (6.7 us).
++M > 16 and K not a multiple of 16 x 64 take F.linear unchanged (cuBLAS is already fast there).
++Reduction order differs from cuBLAS, so the result is not bit-identical to it (fp32 accumulate).
++
++Switch: VLLM_GDN_BA_SPLITK (registered in envs.py, on by default; 0 disables it).
++Proof: "GDN in_proj_ba SPLIT-K ACTIVE: ..." once per process at the first dispatch.
++"""
++import torch
++
++from vllm.logger import init_logger
++from vllm.triton_utils import tl, triton
++from vllm.utils.torch_utils import direct_register_custom_op
++
++logger = init_logger(__name__)
++
++SPLITK_MAX_M = 16
++SPLITK_S = 16
++SPLITK_BK = 64
++_fired = [False]
++
++
++@triton.jit
++def _ba_splitk_kernel(x_ptr, w_ptr, p_ptr, M, N, K: tl.constexpr, KCHUNK: tl.constexpr,
++                      BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
++    pid_n = tl.program_id(0)
++    pid_s = tl.program_id(1)
++    rm = tl.arange(0, BM)
++    rn = pid_n * BN + tl.arange(0, BN)
++    acc = tl.zeros((BM, BN), dtype=tl.float32)
++    k0 = pid_s * KCHUNK
++    for k in range(k0, k0 + KCHUNK, BK):
++        rk = k + tl.arange(0, BK)
++        xa = tl.load(x_ptr + rm[:, None] * K + rk[None, :], mask=rm[:, None] < M, other=0.0)
++        wa = tl.load(w_ptr + rn[:, None] * K + rk[None, :], mask=rn[:, None] < N, other=0.0)
++        acc += tl.dot(xa, tl.trans(wa))
++    tl.store(p_ptr + pid_s * M * N + rm[:, None] * N + rn[None, :], acc,
++             mask=(rm[:, None] < M) & (rn[None, :] < N))
++
++
++def gdn_ba_splitk(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
++    M, K = x.shape
++    N = w.shape[0]
++    if (
++        M > SPLITK_MAX_M
++        or K % (SPLITK_S * SPLITK_BK) != 0
++        or not x.is_contiguous()
++        or not w.is_contiguous()
++    ):
++        return torch.nn.functional.linear(x, w)
++    if not _fired[0]:
++        _fired[0] = True
++        logger.info(
++            "GDN in_proj_ba SPLIT-K ACTIVE: M=%d N=%d K=%d S=%d (dispatch M<=%d)",
++            M, N, K, SPLITK_S, SPLITK_MAX_M)
++    part = torch.empty((SPLITK_S, M, N), device=x.device, dtype=torch.float32)
++    BN = 64
++    _ba_splitk_kernel[(triton.cdiv(N, BN), SPLITK_S)](
++        x, w, part, M, N, K=K, KCHUNK=K // SPLITK_S, BM=16, BN=BN, BK=SPLITK_BK)
++    return part.sum(0).to(x.dtype)
++
++
++def _gdn_ba_splitk_fake(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
++    return x.new_empty((x.shape[0], w.shape[0]))
++
++
++direct_register_custom_op(
++    op_name="gdn_ba_splitk", op_func=gdn_ba_splitk, fake_impl=_gdn_ba_splitk_fake)
+diff --git a/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index bbbb1c8..34ae98f 100644
+--- a/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -23,6 +23,7 @@ from vllm.distributed import (
+ from vllm.forward_context import ForwardContext, get_forward_context
+ from vllm.logger import init_logger
+ from vllm.model_executor.custom_op import CustomOp, PluggableLayer
++from vllm.model_executor.layers.mamba.gdn import ba_splitk as _ba_splitk  # noqa: F401
+ from vllm.model_executor.layers.layernorm import RMSNormGated
+ from vllm.model_executor.layers.linear import (
+     ColumnParallelLinear,
+@@ -446,6 +447,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+             prefix=f"{prefix}.in_proj_ba",
+         )
+         self.disable_tp_for_ba_proj = self.maybe_disable_tp(self.quant_config)
++        # --- GDN in_proj_ba split-K (sm_86, small M): VLLM_GDN_BA_SPLITK ---
++        self.use_ba_splitk = envs.VLLM_GDN_BA_SPLITK
+ 
+         query_key_settings = (self.key_dim, 0, False)
+         value_settings = (self.value_dim, 0, False)
+@@ -910,7 +913,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         # Part 1: Input Projection
+         # ============================================================
+         mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+-        ba, _ = self.in_proj_ba(hidden_states)
++        # --- GDN in_proj_ba split-K (sm_86, small M): VLLM_GDN_BA_SPLITK ---
++        # Unquantized, bias-free projection only; the op dispatches on M itself.
++        if (
++            self.use_ba_splitk
++            and type(self.in_proj_ba.quant_method).__name__ == "UnquantizedLinearMethod"
++            and self.in_proj_ba.bias is None
++        ):
++            ba = torch.ops.vllm.gdn_ba_splitk(hidden_states, self.in_proj_ba.weight)
++        else:
++            ba, _ = self.in_proj_ba(hidden_states)
+ 
+         use_fused_gdn_decode = (
+             self.enable_fused_gdn_decode
+-- 
+2.47.3
+
