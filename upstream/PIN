@@ -1,0 +1,15 @@
+# Merlin engine v2.5.2 bundle (Flash-Next v2.5.1 + the guard fix), pinned to the public release source.
+repo=https://github.com/vllm-project/vllm.git
+base_commit=ced6857afa0ea7b2e3f0846a62e1394e90f15607
+prereqs="ced6857afa0ea7b2e3f0846a62e1394e90f15607"
+bundle=v2.5.2-from-upstream-v0.30.0.bundle
+bundle_sha256=ab70e1a39768d4ae016f7f9f0ae99165c20c0e0136579f557084218cef8bd685
+ref=refs/heads/v2.5.2-public
+tag=v2.5.2
+commit=de6e2c2fe9e02a9f70a5ff6f313aa45abc43b84c
+tree=05e6d1a583e102b32a133ce34519865cacf32c45
+own_C_sha256=6cb8bc7770112a9b31cf0b721a3b3c858a37f0104d06d355afb7ff02b041b4d4
+own_moe_C_sha256=66acb123e71ba0c7b6e1573418b241c93aa83b3f6d7efa3ef4a9ed4ebf191526
+artifacts_tar=build-artifacts-sm86-py313-cu130-v2.2.0.tar.gz
+artifacts_sha256=cdca5ffcb3003d15e00896f0969134e16d7bfbe0a3c6dfe10698bec32573f592
+stock_wheel_version=0.30.0

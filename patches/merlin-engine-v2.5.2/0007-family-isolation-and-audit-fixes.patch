@@ -1,0 +1,288 @@
+diff --git a/envs.py b/envs.py
+index b2d6cccc43..ea12c766a6 100755
+--- a/envs.py
++++ b/envs.py
+@@ -126,7 +126,7 @@ if TYPE_CHECKING:
+     VLLM_FLASHINFER_PLAN_CACHE: bool = True
+     VLLM_GDN_BA_SPLITK: bool = True
+     VLLM_DRAFT_SEQ_LENS_NOSYNC: bool = True
+-    VLLM_DRAFT_SEQ_LENS_VERIFY: bool = False
++    VLLM_DRAFT_SEQ_LENS_VERIFY: bool | None = None
+     VLLM_SKIP_P2P_CHECK: bool = False
+     VLLM_DISABLED_KERNELS: list[str] = []
+     VLLM_USE_HW_AGNOSTIC: bool = False
+@@ -1605,8 +1605,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # os.environ) so both are part of the compile cache key.
+     "VLLM_DRAFT_SEQ_LENS_NOSYNC": lambda: bool(
+         int(os.getenv("VLLM_DRAFT_SEQ_LENS_NOSYNC", "1"))),
+-    "VLLM_DRAFT_SEQ_LENS_VERIFY": lambda: bool(
+-        int(os.getenv("VLLM_DRAFT_SEQ_LENS_VERIFY", "0"))),
++    # None when unset so unset and explicit 0 are distinct compile factors.
++    "VLLM_DRAFT_SEQ_LENS_VERIFY": lambda: (
++        None
++        if "VLLM_DRAFT_SEQ_LENS_VERIFY" not in os.environ
++        else bool(int(os.getenv("VLLM_DRAFT_SEQ_LENS_VERIFY", "0")))
++    ),
+     "VLLM_SKIP_P2P_CHECK": lambda: os.getenv("VLLM_SKIP_P2P_CHECK", "1") == "1",
+     # List of quantization kernels that should be disabled, used for testing
+     # and performance comparisons. Currently only affects MPLinearKernel
+diff --git a/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index c79b9727f9..21947265fb 100644
+--- a/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -481,9 +481,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         # --- GDN in_proj_ba split-K (sm_86, small M): VLLM_GDN_BA_SPLITK ---
+         # Dense Qwen3.5 (the 27B) only: Qwen4Exp builds this same layer class and must
+         # keep the stock in_proj_ba GEMM on the shared engine.
+-        self.use_ba_splitk = bool(envs.VLLM_GDN_BA_SPLITK) and (
+-            vllm_config.model_config.architecture
+-            in ("Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration")
++        # Batch-invariant mode keeps the original linear dispatch (split-K changes the
++        # reduction order and switches implementation at M=16).
++        from vllm.v1.qwen35_series import series_active
++
++        self.use_ba_splitk = (
++            bool(envs.VLLM_GDN_BA_SPLITK)
++            and not envs.VLLM_BATCH_INVARIANT
++            and series_active(vllm_config)
+         )
+ 
+         query_key_settings = (self.key_dim, 0, False)
+diff --git a/v1/attention/backends/flashinfer.py b/v1/attention/backends/flashinfer.py
+index 4152a2b8da..a0203ab7d0 100755
+--- a/v1/attention/backends/flashinfer.py
++++ b/v1/attention/backends/flashinfer.py
+@@ -23,6 +23,7 @@ from flashinfer.prefill import trtllm_batch_context_with_kv_cache
+ from flashinfer.utils import FP4Tensor
+ from typing_extensions import override
+ 
++from vllm.v1.qwen35_series import series_active
+ from vllm import _custom_ops as custom_ops
+ from vllm import envs
+ from vllm.config import (
+@@ -107,9 +108,12 @@ logger = init_logger(__name__)
+ # "next", and the next build takes it instead of calling seq_lens.cpu().
+ _DRAFT_SEQ_LENS = {
+     "enabled": envs.VLLM_DRAFT_SEQ_LENS_NOSYNC,
+-    "verify": envs.VLLM_DRAFT_SEQ_LENS_VERIFY,
++    "verify": bool(envs.VLLM_DRAFT_SEQ_LENS_VERIFY),
+     "next": None,
+     "last": None,
++    # device seq_lens buffer the CPU vector was taken from (ownership tag)
++    "next_buf": None,
++    "last_buf": None,
+     "bypassed": 0,
+     "synced": 0,
+     "verified": 0,
+@@ -709,6 +713,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+         device: torch.device,
+     ):
+         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
++        # 27B series patches are family/device-gated (dense Qwen3.5 on sm_86 only).
++        self._qwen35_series = series_active(vllm_config)
+         self.cache_config = vllm_config.cache_config
+         self.model_config = vllm_config.model_config
+         self.attention_config = vllm_config.attention_config
+@@ -895,6 +901,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+                     # decode wrapper can plan uniform verify batches when FlashInfer is
+                     # new enough.
+                     not self.use_trtllm_decode_attention
++                    and self._qwen35_series
+                     and flashinfer_supports_uniform_multi_token_decode()
+                 )
+             ),
+@@ -1034,7 +1041,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+ 
+         use_non_causal = vllm_config.attention_config.use_non_causal
+         if (
+-            has_uniform_batch_support or flashinfer_supports_uniform_multi_token_decode()
++            has_uniform_batch_support
++            or (
++                series_active(vllm_config)
++                and flashinfer_supports_uniform_multi_token_decode()
++            )
+         ) and (not use_non_causal or is_xqa_arch):
+             return AttentionCGSupport.UNIFORM_BATCH
+         else:
+@@ -1262,6 +1273,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+                 use_tensor_cores=True,
+                 backend=backend,
+             )
++            # plan cache (27B series) only on dense Qwen3.5 / sm_86 wrappers
++            decode_wrapper._vllm_plan_cache_ok = self._qwen35_series
+ 
+             # save the decode wrapper
+             if use_cudagraph:
+@@ -1450,9 +1463,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+             _dsl = _DRAFT_SEQ_LENS
+             _dsl_next = _dsl["next"]
+             _dsl["next"] = None
++            _dsl_next_buf = _dsl.get("next_buf")
++            _dsl["next_buf"] = None
+             if (
+-                _dsl_next is not None
++                self._qwen35_series
++                and _dsl_next is not None
+                 and _dsl_next.shape[0] == common_attn_metadata.seq_lens.shape[0]
++                and _dsl_next_buf == common_attn_metadata.seq_lens.data_ptr()
+             ):
+                 seq_lens_cpu = _dsl_next
+                 _dsl["bypassed"] += 1
+@@ -1479,8 +1496,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+                 with gpu_sync_allowed():
+                     seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
+                 _dsl["synced"] += 1
+-            if _dsl["enabled"]:
++            if _dsl["enabled"] and self._qwen35_series:
+                 _dsl["last"] = seq_lens_cpu
++                _dsl["last_buf"] = common_attn_metadata.seq_lens.data_ptr()
+         else:
+             seq_lens_cpu = None
+ 
+@@ -2791,8 +2809,10 @@ def fast_plan_decode(
+     # fa2 is enforced, not assumed: FlashInfer 0.6.18 resolves backend="auto" to a
+     # concrete name in the first plan() (always taken above), so anything other than
+     # "fa2" here (fa3, trtllm-gen, cute-dsl, unresolved) bypasses the cache.
++    _pending_plan_key = None
+     if (
+         envs.VLLM_FLASHINFER_PLAN_CACHE
++        and getattr(self, "_vllm_plan_cache_ok", False)
+         and getattr(self, "_backend", None) == "fa2"
+     ):
+         _key = (
+@@ -2826,7 +2846,10 @@ def fast_plan_decode(
+         ) is not None:
+             self._vllm_plan_cache_hits = _h + 1
+             return
+-        self._vllm_plan_key = _key
++        # Publish the key only after the plan succeeds: a failed plan must not
++        # leave a key that a retry would treat as a hit on the previous plan.
++        self._vllm_plan_key = None
++        _pending_plan_key = _key
+         self._vllm_plan_cache_misses = _m + 1
+     else:
+         self._vllm_plan_key = None
+@@ -2855,6 +2878,8 @@ def fast_plan_decode(
+         disable_split_kv=disable_split_kv,
+         **uniform_decode_kwargs,
+     )
++    if _pending_plan_key is not None:
++        self._vllm_plan_key = _pending_plan_key
+ 
+ 
+ @triton.jit
+diff --git a/v1/qwen35_series.py b/v1/qwen35_series.py
+new file mode 100644
+index 0000000000..141292c67d
+--- /dev/null
++++ b/v1/qwen35_series.py
+@@ -0,0 +1,26 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Family gate for the Qwen3.8-27B series patches (dense Qwen3.5 on sm_86).
++
++The 27B patches (uniform multi-token FlashInfer decode, the decode-plan cache, the
++MTP draft seq_lens no-sync and the GDN in_proj_ba split-K) were validated only for
++the dense Qwen3.5 architectures on Ampere sm_86. On the shared engine every other
++family (Flash-Next = Qwen4Exp included) and every other device must take the stock
++path, so each patch asks this one predicate and fails closed.
++"""
++
++DENSE_QWEN35_ARCHS = ("Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration")
++
++
++def is_dense_qwen35(architecture: str | None) -> bool:
++    return architecture in DENSE_QWEN35_ARCHS
++
++
++def series_active(vllm_config) -> bool:
++    """True only for a dense Qwen3.5 target on an sm_86 device."""
++    model_config = getattr(vllm_config, "model_config", None)
++    if model_config is None or not is_dense_qwen35(model_config.architecture):
++        return False
++    from vllm.platforms import current_platform
++
++    cap = current_platform.get_device_capability()
++    return cap is not None and cap.to_int() == 86
+diff --git a/v1/worker/gpu/spec_decode/autoregressive/speculator.py b/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+index 472748a0ee..bc934fa304 100644
+--- a/v1/worker/gpu/spec_decode/autoregressive/speculator.py
++++ b/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+@@ -5,6 +5,7 @@ from typing import Any
+ import torch
+ import torch.nn as nn
+ 
++from vllm.v1.qwen35_series import series_active
+ from vllm import envs
+ from vllm.config import VllmConfig
+ from vllm.config.compilation import CUDAGraphMode
+@@ -52,7 +53,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+         # State shared with the FlashInfer metadata builder; None when off or unavailable.
+         self._draft_seq_lens = None
+         self._draft_seq_lens_fired = False
+-        if envs.VLLM_DRAFT_SEQ_LENS_NOSYNC:
++        if envs.VLLM_DRAFT_SEQ_LENS_NOSYNC and series_active(vllm_config):
+             try:
+                 from vllm.v1.attention.backends.flashinfer import _DRAFT_SEQ_LENS
+             except ImportError:
+@@ -556,21 +557,26 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+                     and _dsl["last"] is not None
+                 ):
+                     _dsl["next"] = torch.clamp(_dsl["last"] + 1, max=self.max_model_len)
++                    _dsl["next_buf"] = _dsl.get("last_buf")
+                     if not self._draft_seq_lens_fired:
+                         self._draft_seq_lens_fired = True
+                         logger.info(
+                             "DRAFT SEQ_LENS NOSYNC ACTIVE: draft step %d takes the previous "
+                             "build's CPU seq_lens + 1 (V2 speculator)", step)
+-                attn_metadata = self._build_uniform_attn_metadata(
+-                    num_reqs=num_reqs,
+-                    batch_desc=batch_desc,
+-                    num_query_per_req=1,
+-                    seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+-                    step=step,
+-                )
+-                if _dsl is not None:
+-                    # never hand a derived length to a later, non-draft build
+-                    _dsl["next"] = None
++                try:
++                    attn_metadata = self._build_uniform_attn_metadata(
++                        num_reqs=num_reqs,
++                        batch_desc=batch_desc,
++                        num_query_per_req=1,
++                        seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
++                        step=step,
++                    )
++                finally:
++                    if _dsl is not None:
++                        # never hand a derived length to a later, non-draft build,
++                        # including after an exception inside the metadata build
++                        _dsl["next"] = None
++                        _dsl["next_buf"] = None
+ 
+             self.current_draft_step.fill_(step)
+ 
+diff --git a/v1/worker/gpu_model_runner.py b/v1/worker/gpu_model_runner.py
+index a9dc8024fc..9a4705c01e 100644
+--- a/v1/worker/gpu_model_runner.py
++++ b/v1/worker/gpu_model_runner.py
+@@ -5325,6 +5325,20 @@ class GPUModelRunner(
+         Args:
+             load_dummy_weights: load dummy weights instead of real weights.
+         """
++        # 27B series: host-resident embeddings and the draft seq_lens no-sync live in
++        # the V2 runner only. Refuse an explicit request this runner cannot honour.
++        from vllm.v1.qwen35_series import is_dense_qwen35
++
++        if is_dense_qwen35(self.model_config.architecture):
++            if envs.VLLM_HOST_EMBED_TABLE is True:
++                raise ValueError(
++                    "VLLM_HOST_EMBED_TABLE=1 needs the V2 model runner; this engine "
++                    "selected V1 (VLLM_USE_V2_MODEL_RUNNER=0 or a V1-only feature)."
++                )
++            logger.warning(
++                "dense Qwen3.5 on the V1 model runner: host-resident embeddings and the "
++                "draft seq_lens no-sync are not active (both are V2-runner only)."
++            )
+         logger.info_once(
+             "Starting to load model %s...",
+             self.model_config.model,

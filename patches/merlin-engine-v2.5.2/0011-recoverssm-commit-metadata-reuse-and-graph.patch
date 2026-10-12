@@ -1,0 +1,1527 @@
+diff --git a/envs.py b/envs.py
+index ea12c766a6..a1d8f6e11b 100755
+--- a/envs.py
++++ b/envs.py
+@@ -127,6 +127,12 @@ if TYPE_CHECKING:
+     VLLM_GDN_BA_SPLITK: bool = True
+     VLLM_DRAFT_SEQ_LENS_NOSYNC: bool = True
+     VLLM_DRAFT_SEQ_LENS_VERIFY: bool | None = None
++    # RecoverSSM: enqueue the post-sampling GDN commit (and the mamba align
++    # postprocess that consumes it) after the MTP proposal instead of before it,
++    # on the same stream. AOT: no -- Python call order after sampling, outside
++    # the compiled forward. CAPTURE: no -- not inside any captured graph.
++    # Ignored factor, so an A/B flip reuses one AOT cache.
++    VLLM_RECOVERSSM_COMMIT_AFTER_PROPOSE: bool = False
+     VLLM_SKIP_P2P_CHECK: bool = False
+     VLLM_DISABLED_KERNELS: list[str] = []
+     VLLM_USE_HW_AGNOSTIC: bool = False
+@@ -482,6 +488,19 @@ if TYPE_CHECKING:
+     # set (e.g. "FULL", "FULL_DECODE_ONLY"). AOT: no. CAPTURE: no -- it asserts
+     # an identity, it does not choose one. Ignored factor.
+     VLLM_E2_EXPECTED_CUDAGRAPH_MODE: str = ""
++    # RecoverSSM post-sampling commit execution mode
++    # (vllm/v1/worker/gpu/model_states/recoverssm_commit_graph.py): "eager"/"0"/unset
++    # = the unchanged launch chain, "staged" = staged inputs + eager chain (control
++    # arm), "graph"/"1" = staged inputs + a replayed standalone CUDA graph of the same
++    # chain. Default only: the worker method set_recoverssm_commit_mode flips it in a
++    # running process; the boot value also decides whether the CUDA-graph capture
++    # phase captures the commit graphs (not for eager). AOT: no -- read by Python
++    # after sampling, outside the compiled forward. CAPTURE: no for the forward
++    # graphs; the commit graphs are separate in-process graphs, keyed on the step's
++    # tensors, never cached across processes, and bit-identical to the eager chain.
++    # Ignored factor, so an A/B flip reuses one AOT cache. Unknown values raise at
++    # boot.
++    VLLM_RECOVERSSM_COMMIT_GRAPH: str = ""
+     #
+     # The unaudited-knob fence that stood here listed the
+     # tie-determinism toggles as not-yet-in-tree. They landed with the
+@@ -1611,6 +1630,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
+         if "VLLM_DRAFT_SEQ_LENS_VERIFY" not in os.environ
+         else bool(int(os.getenv("VLLM_DRAFT_SEQ_LENS_VERIFY", "0")))
+     ),
++    # See its declaration. Default off.
++    "VLLM_RECOVERSSM_COMMIT_AFTER_PROPOSE": lambda: bool(
++        int(os.getenv("VLLM_RECOVERSSM_COMMIT_AFTER_PROPOSE", "0"))
++    ),
+     "VLLM_SKIP_P2P_CHECK": lambda: os.getenv("VLLM_SKIP_P2P_CHECK", "1") == "1",
+     # List of quantization kernels that should be disabled, used for testing
+     # and performance comparisons. Currently only affects MPLinearKernel
+@@ -2494,6 +2517,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_E2_EXPECTED_CUDAGRAPH_MODE": lambda: os.getenv(
+         "VLLM_E2_EXPECTED_CUDAGRAPH_MODE", ""
+     ).strip(),
++    "VLLM_RECOVERSSM_COMMIT_GRAPH": lambda: os.getenv(
++        "VLLM_RECOVERSSM_COMMIT_GRAPH", ""
++    ).strip(),
+     "VLLM_QSA_KV_SCALES": lambda: os.getenv("VLLM_QSA_KV_SCALES", "").strip(),
+     "VLLM_E2_GUARD_MODE": lambda: (
+         os.getenv("VLLM_E2_GUARD_MODE", "warn").strip().lower()
+@@ -2854,6 +2880,9 @@ def compile_factors() -> dict[str, object]:
+         "VLLM_TUNED_CONFIG_FOLDER",
+         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
+         "VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS",
++        # RecoverSSM commit order (after vs before the MTP proposal): eager Python
++        # call order after sampling; nothing compiled or captured depends on it.
++        "VLLM_RECOVERSSM_COMMIT_AFTER_PROPOSE",
+         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
+         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
+         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",
+@@ -2935,6 +2964,10 @@ def compile_factors() -> dict[str, object]:
+         # expected-mode pin asserts one; neither IS one.
+         "VLLM_E2_ALLOW_BREAKABLE",
+         "VLLM_E2_EXPECTED_CUDAGRAPH_MODE",
++        # RecoverSSM commit execution mode: read only after sampling, outside the
++        # compiled forward and its capture; the commit graphs it selects are
++        # in-process and bit-identical to the eager chain (see its declaration).
++        "VLLM_RECOVERSSM_COMMIT_GRAPH",
+         # INERT on the 0.30 base: no read site, so it cannot change any artifact.
+         # Hashing it would invalidate caches for no behavioural change. Restore
+         # it to the compile factors in the same commit that relands its reader.
+diff --git a/model_executor/layers/mamba/gdn/recoverssm_gdn.py b/model_executor/layers/mamba/gdn/recoverssm_gdn.py
+index 8adc0941e6..f6ea153a21 100644
+--- a/model_executor/layers/mamba/gdn/recoverssm_gdn.py
++++ b/model_executor/layers/mamba/gdn/recoverssm_gdn.py
+@@ -418,8 +418,11 @@ def _commit_gdn_state_kernel(
+     )
+ 
+ 
+-@dataclass
++@dataclass(frozen=True)
+ class GDNRecoverSSMCommitContext:
++    # Frozen: the post-sampling commit graphs (recoverssm_commit_graph.py) record
++    # these tensors' addresses and the geometry derived from them, keyed on the
++    # context's identity, so no field may be rebound for the context's lifetime.
+     conv_states: tuple[torch.Tensor, ...]
+     conv_state_base_addrs: torch.Tensor
+     conv_state_block_strides: torch.Tensor
+diff --git a/v1/attention/backends/gdn_recoverssm.py b/v1/attention/backends/gdn_recoverssm.py
+index e1c12ac6a3..d84e61c1e2 100644
+--- a/v1/attention/backends/gdn_recoverssm.py
++++ b/v1/attention/backends/gdn_recoverssm.py
+@@ -8,7 +8,7 @@ column, num_accepted_tokens is always 1 (the checkpoint and the compacted conv w
+ already hold the accepted state), and the metadata carries what the post-sampling commit
+ needs. Mirrors the Kimi-K3 KDA builder's RecoverSSM handling."""
+ 
+-from dataclasses import dataclass, field, fields, replace
++from dataclasses import dataclass, field, replace
+ from typing import Any
+ 
+ import torch
+@@ -27,6 +27,10 @@ from vllm.v1.attention.backends.recoverssm_metadata import (
+     recoverssm_request_indices,
+     recoverssm_spec_rows,
+ )
++from vllm.v1.attention.backends.utils import (
++    NULL_BLOCK_ID,
++    mamba_get_block_table_tensor,
++)
+ 
+ logger = init_logger(__name__)
+ 
+@@ -47,31 +51,49 @@ class GDNRecoverSSMCommitMetadata:
+ class GDNRecoverSSMMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
+     recoverssm_commit: GDNRecoverSSMCommitMetadata | None = None
+     recoverssm_context: Any = field(default=None, repr=False, compare=False)
++    # The batch's seq_lens, so `update_block_table` can derive another group's
++    # align-mode state indices exactly as `build` does.
++    recoverssm_seq_lens: torch.Tensor | None = field(
++        default=None, repr=False, compare=False
++    )
+ 
+     def commit_recoverssm_state(
+-        self, num_accepted_tokens: torch.Tensor
++        self,
++        num_accepted_tokens: torch.Tensor,
++        *,
++        num_computed_tokens: torch.Tensor | None = None,
+     ) -> RecoverSSMPostprocessMetadata | None:
++        """Run this group's commit. ``num_computed_tokens`` replaces the align-mode
++        count tensor with a staged copy of the same values (the commit-graph path,
++        whose replays read fixed addresses); None keeps the metadata's own tensor."""
+         c = self.recoverssm_commit
+         if c is None:
+             return None
+         n = self.num_spec_decodes
++        nc = c.num_computed_tokens
++        if num_computed_tokens is not None:
++            if nc is None:
++                raise ValueError(
++                    "GDN RecoverSSM: num_computed_tokens override outside align mode"
++                )
++            nc = num_computed_tokens
+         self.recoverssm_context.commit(
+             num_accepted_tokens,
+             c.state_indices[:n, 0],
+             c.query_start_loc[: n + 1],
+             request_indices=c.request_indices,
+             block_table=c.block_table,
+-            num_computed_tokens=c.num_computed_tokens,
++            num_computed_tokens=nc,
+             mamba_block_size=c.block_size,
+         )
+         if c.block_table is None:
+             return None
+-        assert c.block_size is not None and c.num_computed_tokens is not None
++        assert c.block_size is not None and nc is not None
+         return RecoverSSMPostprocessMetadata(
+             num_spec_decodes=n,
+             request_indices=c.request_indices,
+             block_table=c.block_table,
+-            num_computed_tokens=c.num_computed_tokens,
++            num_computed_tokens=nc,
+             block_size=c.block_size,
+         )
+ 
+@@ -85,16 +107,32 @@ class GDNRecoverSSMMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
+         )
+ 
+ 
+-def _check_context_binding(context: Any, checkpoints: list[torch.Tensor]) -> None:
++def _binding_signature(checkpoints: Any) -> tuple:
++    """Storage identity of every layer's checkpoint: (data_ptr, shape, stride).
++
++    The context's address table (base addresses, block strides) is derived from
++    exactly these values. Tensor identity alone does not pin them: ``set_()``
++    (or an in-place resize) moves a tensor's storage while keeping the object."""
++    return tuple((t.data_ptr(), t.shape, t.stride()) for t in checkpoints)
++
++
++def _check_context_binding(
++    context: Any, checkpoints: list[torch.Tensor], bound: tuple | None = None
++) -> None:
+     """A cached commit context must point at the layers' live KV cache.
+ 
+     The context stores raw base addresses of every layer's conv, state and
+     replay tensors. One that outlived its cache (the profiling KV cache is
+     torn down and re-allocated before serving) would keep that cache alive
+     and, worse, commit into freed memory. Builders are re-created with the
+-    real cache, so a mismatch is a lifecycle bug: fail loudly."""
+-    bound = [t.data_ptr() for t in context.checkpoints]
+-    live = [t.data_ptr() for t in checkpoints]
++    real cache, so a mismatch is a lifecycle bug: fail loudly.
++
++    ``bound`` is the checkpoints' signature recorded when the context was
++    built. Without it the context's own tensors are signed now, which cannot
++    see a storage change made to those same tensor objects."""
++    if bound is None:
++        bound = _binding_signature(context.checkpoints)
++    live = _binding_signature(checkpoints)
+     if bound != live:
+         raise RuntimeError(
+             "GDN RecoverSSM commit context is bound to a different KV cache than "
+@@ -102,6 +140,22 @@ def _check_context_binding(context: Any, checkpoints: list[torch.Tensor]) -> Non
+         )
+ 
+ 
++def _promote(meta: GDNAttentionMetadata, **extra: Any) -> GDNRecoverSSMMetadata:
++    """The base builder's metadata as GDNRecoverSSMMetadata: the same field values
++    plus ``extra``. Equivalent to ``GDNRecoverSSMMetadata(**{f.name: getattr(meta,
++    f.name) for f in fields(meta)}, **extra)`` (both are plain dataclasses without
++    ``__post_init__`` or slots) without the per-step ``fields()`` walk and keyword
++    re-binding of ~30 fields."""
++    out = GDNRecoverSSMMetadata.__new__(GDNRecoverSSMMetadata)
++    d = out.__dict__
++    d.update(meta.__dict__)
++    d["recoverssm_commit"] = None
++    d["recoverssm_context"] = None
++    d["recoverssm_seq_lens"] = None
++    d.update(extra)
++    return out
++
++
+ class GDNRecoverSSMMetadataBuilder(GDNAttentionMetadataBuilder):
+     # Uniform spec-decode batches replay as FULL graphs: the base builder stages the
+     # state indices, query offsets and accepted counts into persistent buffers and pads
+@@ -114,15 +168,31 @@ class GDNRecoverSSMMetadataBuilder(GDNAttentionMetadataBuilder):
+         max_reqs = vllm_config.scheduler_config.max_num_seqs
+         self._ones = torch.ones(max_reqs, dtype=torch.int32, device=device)
+         self._context: Any = None
++        self._context_binding: tuple | None = None
+         self._logged = False
+         self._capturing = False
++        # MRV2 builds the first GDN group and hands the later groups of the same spec
++        # to `update_block_table` (attn_utils.build_attn_metadata), like the plain
++        # GDN builder. Everything but the state indices (and this group's commit) is
++        # batch-level. Same conditions as the base builder, minus its exact-type
++        # check, which only excluded subclasses with per-group metadata: ours is
++        # rebuilt per group below. No aligned-index precompute
++        # (`mamba_aligned_state_indices` stays unset): both paths derive the indices
++        # with `mamba_get_block_table_tensor`, as `build` always did.
++        self.supports_update_block_table = (
++            vllm_config.use_v2_model_runner and device.type == "cuda"
++        )
+ 
+     def _get_context(self):
+         if self._context is not None:
+             fc = self.vllm_config.compilation_config.static_forward_context
+-            _check_context_binding(
+-                self._context, [fc[name].kv_cache[1] for name in self.layer_names]
+-            )
++            # Every layer's checkpoint, first or not, must still have the storage the
++            # context's address table was built from: data_ptr, shape and stride as
++            # recorded at build time. Identity is not enough (set_() keeps the object
++            # and moves the storage), and a non-first layer is reached only through
++            # that table, so no direct pointer check downstream would notice.
++            live = [fc[name].kv_cache[1] for name in self.layer_names]
++            _check_context_binding(self._context, live, self._context_binding)
+         if self._context is None:
+             from vllm.model_executor.layers.mamba.gdn.recoverssm_gdn import (
+                 GDNRecoverSSMCommitContext,
+@@ -135,6 +205,9 @@ class GDNRecoverSSMMetadataBuilder(GDNAttentionMetadataBuilder):
+                 spec_query_len=1 + self.num_spec,
+                 max_num_reqs=self.vllm_config.scheduler_config.max_num_seqs,
+             )
++            self._context_binding = _binding_signature(
++                [layer.kv_cache[1] for layer in layers]
++            )
+             logger.info(
+                 "GDN RecoverSSM commit context: %d layers, spec_query_len %d",
+                 len(layers),
+@@ -174,41 +247,117 @@ class GDNRecoverSSMMetadataBuilder(GDNAttentionMetadataBuilder):
+             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+             fast_build=fast_build,
+         )
+-        base = {f.name: getattr(meta, f.name) for f in fields(meta)}
+-        commit = None
++        extra: dict[str, Any] = {"recoverssm_seq_lens": m.seq_lens}
+         if meta.num_spec_decodes > 0:
+             n = meta.num_spec_decodes
+             assert meta.spec_state_indices_tensor is not None
+-            base["spec_state_indices_tensor"] = meta.spec_state_indices_tensor[:, :1]
++            state_indices = meta.spec_state_indices_tensor[:, :1]
++            extra["spec_state_indices_tensor"] = state_indices
+             # One accepted token per row: the checkpoint already holds the accepted
+             # state. Sized like the (possibly graph-padded) state indices.
+-            base["num_accepted_tokens"] = self._ones[
+-                : base["spec_state_indices_tensor"].shape[0]
+-            ]
++            extra["num_accepted_tokens"] = self._ones[: state_indices.shape[0]]
+             if rows is None:
+                 raise ValueError("GDN RecoverSSM: spec rows without draft counts")
+             request_indices = recoverssm_request_indices(
+                 rows, n, m.query_start_loc.device
+             )
+             align = self.vllm_config.cache_config.mamba_cache_mode == "align"
+-            commit = GDNRecoverSSMCommitMetadata(
+-                state_indices=base["spec_state_indices_tensor"],
++            extra["recoverssm_commit"] = GDNRecoverSSMCommitMetadata(
++                state_indices=state_indices,
+                 query_start_loc=meta.spec_query_start_loc,
+                 request_indices=request_indices,
+                 block_table=m.block_table_tensor if align else None,
+                 num_computed_tokens=m.compute_num_computed_tokens() if align else None,
+                 block_size=self.kv_cache_spec.block_size if align else None,
+             )
++            extra["recoverssm_context"] = self._get_context()
+             if not self._logged:
+                 self._logged = True
+                 logger.info(
+                     "GDN RecoverSSM path taken: %d spec rows, align=%s", n, align
+                 )
+-        return GDNRecoverSSMMetadata(
+-            **base,
+-            recoverssm_commit=commit,
+-            recoverssm_context=self._get_context() if commit is not None else None,
++        return _promote(meta, **extra)
++
++    def update_block_table(  # type: ignore[override]
++        self,
++        metadata: GDNRecoverSSMMetadata,
++        blk_table: torch.Tensor,
++        slot_mapping: torch.Tensor,
++    ) -> GDNRecoverSSMMetadata:
++        """Metadata for another GDN group of the batch `metadata` was built for.
++
++        Every field `build` derives from this group's block table is re-derived
++        the same way: `mamba_get_block_table_tensor` on this group's table and
++        the batch seq_lens, the same spec/non-spec/prefill gathers, staging into
++        this builder's own state-index buffers, the checkpoint column, and a
++        commit with this group's state indices, block table, block size and
++        context. The rest is batch-level (the same query offsets, seq_lens, CPU
++        classification and accepted counts feed every group), so it is shared
++        with `metadata` instead of being rebuilt: the spec-row classification,
++        query offsets, request rows and computed-token counts of the commit."""
++        m = metadata
++        if not isinstance(m, GDNRecoverSSMMetadata):
++            raise TypeError("GDN RecoverSSM can only reuse RecoverSSM metadata")
++        block_table_tensor = mamba_get_block_table_tensor(
++            blk_table,
++            m.recoverssm_seq_lens,
++            self.kv_cache_spec,
++            self.vllm_config.cache_config.mamba_cache_mode,
+         )
++        # Same gathers as build() / GDNAttentionMetadataBuilder.update_block_table.
++        masks = m.spec_sequence_masks_cpu
++        spec_indices = non_spec_indices = prefill_indices = None
++        if masks is None:
++            non_spec_indices = block_table_tensor[:, 0]
++            if m.num_prefills > 0:
++                prefill_indices = non_spec_indices[m.num_decodes :]
++        else:
++            spec_indices = block_table_tensor[masks, : self.num_spec + 1]
++            if m.num_prefills > 0:
++                non_spec_indices = prefill_indices = block_table_tensor[~masks, 0]
++
++        if self._stage_spec_decode(
++            m.num_prefills, m.num_decodes, m.num_spec_decodes, m.num_spec_decode_tokens
++        ):
++            assert m.spec_state_indices_tensor is not None
++            batch_size = m.spec_state_indices_tensor.shape[0]
++            self.spec_state_indices_tensor[: m.num_spec_decodes].copy_(
++                spec_indices, non_blocking=True
++            )
++            spec_indices = self.spec_state_indices_tensor[:batch_size]
++            spec_indices[m.num_spec_decodes :].fill_(NULL_BLOCK_ID)
++
++        if self._stage_decode(m.num_prefills, m.num_decodes, m.num_spec_decodes):
++            assert m.non_spec_state_indices_tensor is not None
++            batch_size = m.non_spec_state_indices_tensor.shape[0]
++            self.non_spec_state_indices_tensor[: m.num_decodes].copy_(
++                non_spec_indices, non_blocking=True
++            )
++            non_spec_indices = self.non_spec_state_indices_tensor[:batch_size]
++            non_spec_indices[m.num_decodes :].fill_(NULL_BLOCK_ID)
++
++        changes: dict[str, Any] = {
++            "spec_state_indices_tensor": spec_indices,
++            "non_spec_state_indices_tensor": non_spec_indices,
++            "prefill_state_indices": prefill_indices,
++        }
++        first = m.recoverssm_commit
++        if m.num_spec_decodes > 0:
++            assert spec_indices is not None and first is not None
++            state_indices = spec_indices[:, :1]
++            changes["spec_state_indices_tensor"] = state_indices
++            changes["num_accepted_tokens"] = self._ones[: state_indices.shape[0]]
++            align = first.block_table is not None
++            changes["recoverssm_commit"] = GDNRecoverSSMCommitMetadata(
++                state_indices=state_indices,
++                query_start_loc=first.query_start_loc,
++                request_indices=first.request_indices,
++                block_table=blk_table if align else None,
++                num_computed_tokens=first.num_computed_tokens,
++                block_size=self.kv_cache_spec.block_size if align else None,
++            )
++            changes["recoverssm_context"] = self._get_context()
++        return replace(m, **changes)
+ 
+     def build_for_cudagraph_capture(
+         self, common_attn_metadata: CommonAttentionMetadata
+diff --git a/v1/attention/backends/recoverssm_metadata.py b/v1/attention/backends/recoverssm_metadata.py
+index 135b3eba4c..d1a217365c 100644
+--- a/v1/attention/backends/recoverssm_metadata.py
++++ b/v1/attention/backends/recoverssm_metadata.py
+@@ -4,6 +4,7 @@
+ import abc
+ from dataclasses import dataclass, replace
+ 
++import numpy as np
+ import torch
+ 
+ 
+@@ -58,13 +59,19 @@ def recoverssm_spec_rows(
+     every row that has drafts. Only the first ``num_reqs`` rows are real; padding rows
+     never take the spec path. Returns the draft-count vector to hand to the base builder
+     (1 for spec rows, -1 otherwise, padding included) and the spec rows in batch order,
+-    which is also the order of the base builder's spec state indices."""
+-    query_lens = query_start_loc_cpu[: num_reqs + 1].diff()
+-    active_decode = (~is_prefilling_cpu[:num_reqs]) & (query_lens > 0)
+-    spec_mask = (num_decode_draft_tokens_cpu[:num_reqs] >= 0) | active_decode
+-    drafts = torch.full_like(num_decode_draft_tokens_cpu, -1)
+-    drafts[:num_reqs] = torch.where(spec_mask, 1, -1).to(drafts.dtype)
+-    return drafts, spec_mask.nonzero().flatten()
++    which is also the order of the base builder's spec state indices.
++
++    Computed with NumPy views of the CPU tensors: the same values and dtypes as
++    the torch formulation (drafts keep the input dtype, rows are int64), at a
++    fraction of the per-op dispatch cost of six small CPU torch ops."""
++    query_lens = np.diff(query_start_loc_cpu.numpy()[: num_reqs + 1])
++    active_decode = ~is_prefilling_cpu.numpy()[:num_reqs] & (query_lens > 0)
++    draft_counts = num_decode_draft_tokens_cpu.numpy()
++    spec_mask = (draft_counts[:num_reqs] >= 0) | active_decode
++    drafts = np.full_like(draft_counts, -1)
++    drafts[:num_reqs][spec_mask] = 1
++    rows = np.flatnonzero(spec_mask).astype(np.int64, copy=False)
++    return torch.from_numpy(drafts), torch.from_numpy(rows)
+ 
+ 
+ def recoverssm_request_indices(
+diff --git a/v1/worker/gpu/model_runner.py b/v1/worker/gpu/model_runner.py
+index 46bb259963..25b5924e68 100644
+--- a/v1/worker/gpu/model_runner.py
++++ b/v1/worker/gpu/model_runner.py
+@@ -322,6 +322,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         self.is_encoder_decoder = self.model_config.is_encoder_decoder
+ 
+         self.output_copy_stream = torch.cuda.Stream(self.device)
++        # RecoverSSM: enqueue the GDN commit after the MTP proposal (same stream).
++        self._recoverssm_commit_after_propose = (
++            envs.VLLM_RECOVERSSM_COMMIT_AFTER_PROPOSE
++        )
++        # Eligibility gate, created at the first sampled step (it needs the
++        # drafter's attention groups).
++        self._recoverssm_defer_ok: Any = None
++        self._recoverssm_deferred_steps = 0  # proof counter for the A/B kit
+ 
+         # Pipeline parallelism.
+         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+@@ -1796,6 +1804,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         num_sampled: torch.Tensor,
+         num_rejected: torch.Tensor,
+         query_start_loc: torch.Tensor | None = None,
++        defer_state_tail: bool = False,
+     ) -> None:
+         # Update the number of computed tokens.
+         if self.is_last_pp_rank:
+@@ -1816,10 +1825,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             self.req_states.total_len.gpu,
+         )
+ 
++        if defer_state_tail:
++            # The model state's commits wait for flush_deferred_postprocess().
++            self.model_state.postprocess_state(
++                idx_mapping,
++                num_sampled,
++                self.req_states.num_computed_tokens.gpu,
++                defer_tail=True,
++            )
++            return
+         self.model_state.postprocess_state(
+             idx_mapping, num_sampled, self.req_states.num_computed_tokens.gpu
+         )
+ 
++    def _recoverssm_can_defer(self) -> bool:
++        """Whether the RecoverSSM commit may wait for the MTP proposal (see
++        recoverssm_order.commit_after_propose_eligibility; cached per drafter
++        attention-group inventory and parallel setup)."""
++        gate = self._recoverssm_defer_ok
++        if gate is None:
++            from vllm.v1.worker.gpu.recoverssm_order import CommitAfterProposeGate
++
++            gate = self._recoverssm_defer_ok = CommitAfterProposeGate(logger)
++        return gate.eligible(
++            self.speculator, self.model_state, self.pp_handler, self.pcp_manager
++        )
++
+     def _merge_ec_connector_no_forward(
+         self, scheduler_output: SchedulerOutput, output: ModelRunnerOutput
+     ) -> ModelRunnerOutput:
+@@ -1879,6 +1910,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         context_len: int = 0,
+         valid_dummy_state_slots: bool = False,
+     ) -> ModelRunnerOutput | IntermediateTensors | None:
++        # A RecoverSSM commit deferred past the last proposal must have been
++        # enqueued before anything here mutates request state, rebuilds metadata
++        # or runs a forward (dummy runs included).
++        self.model_state.check_deferred_postprocess()
+         if not dummy_run:
+             # Bounds-guard instrumentation: raise on the engine thread if a bounds guard fired.
+             # A Python bool; adds no device sync to the step. Late and
+@@ -2470,12 +2505,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # ensuring that `copy_event` is recorded before calling postprocess.
+         # This sequencing may slightly reduce latency as async D2H copy does not
+         # need to wait for the postprocess to finish.
++        # VLLM_RECOVERSSM_COMMIT_AFTER_PROPOSE: the request-state updates the
++        # drafter reads (num_computed_tokens, last_sampled_tokens, the accepted
++        # counts) still run here; the model state's commits (RecoverSSM GDN
++        # commit + align postprocess) are enqueued after the proposal below.
++        defer_state_tail = (
++            self._recoverssm_commit_after_propose and self._recoverssm_can_defer()
++        )
+         self.postprocess_sampled(
+             input_batch.idx_mapping,
+             sampler_output.sampled_token_ids,
+             num_sampled,
+             num_rejected,
+             input_batch.query_start_loc,
++            defer_state_tail=defer_state_tail,
+         )
+ 
+         if self.speculator is not None:
+@@ -2531,6 +2574,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     self.req_states.draft_tokens, input_batch
+                 )
+ 
++        if defer_state_tail:
++            # After the proposal and the draft-token copies, before the KV
++            # connector sees the step: same stream, before the next forward.
++            self.model_state.flush_deferred_postprocess()
++            self._recoverssm_deferred_steps += 1
++
+         # Post-step KV connector related operations.
+         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+         model_runner_output.kv_connector_output = kv_connector_output
+diff --git a/v1/worker/gpu/model_states/interface.py b/v1/worker/gpu/model_states/interface.py
+index 6f41111bd9..9e57a01f0e 100644
+--- a/v1/worker/gpu/model_states/interface.py
++++ b/v1/worker/gpu/model_states/interface.py
+@@ -163,6 +163,20 @@ class ModelState(ABC):
+     ) -> None:
+         return None
+ 
++    # Whether postprocess_state accepts ``defer_tail=True``: run the part the
++    # drafter needs now and hold the rest (state commits nobody reads before the
++    # next forward) until flush_deferred_postprocess(), which the runner calls
++    # after the speculator's proposal, on the same stream.
++    supports_deferred_postprocess: bool = False
++
++    def flush_deferred_postprocess(self) -> None:
++        return None
++
++    def check_deferred_postprocess(self) -> None:
++        """Raise if a deferred postprocess is still pending or failed (called
++        before the next step mutates state). No-op by default."""
++        return None
++
+     def detach_deferred_state(self) -> Any:
+         """Non-last PP rank, after this step's forward: hand over any state the
+         step's postprocess needs once its sampled tokens arrive (pp_size steps
+diff --git a/v1/worker/gpu/model_states/mamba_hybrid.py b/v1/worker/gpu/model_states/mamba_hybrid.py
+index b31a0ce5c8..bab04fe84e 100644
+--- a/v1/worker/gpu/model_states/mamba_hybrid.py
++++ b/v1/worker/gpu/model_states/mamba_hybrid.py
+@@ -100,6 +100,12 @@ class MambaHybridModelState(DefaultModelState):
+         self.recoverssm = (
+             RecoverSSMState() if self.cache_config.use_recoverssm else None
+         )
++        # (idx_mapping, num_sampled, num_computed_tokens, recorded step) of a
++        # postprocess tail held until flush_deferred_postprocess().
++        self._deferred_tail: tuple[Any, ...] | None = None
++        # Set when a deferred tail could not be enqueued: the GDN/conv state is
++        # not the committed state, so the runner must not run another step.
++        self._deferred_tail_error: str | None = None
+         if self._align_mode:
+             self._mamba_state_idx_gpu = torch.zeros(
+                 self.max_num_reqs, dtype=torch.int32, device=self.device
+@@ -356,6 +362,8 @@ class MambaHybridModelState(DefaultModelState):
+                 attn_metadata,
+                 attn_groups,
+                 for_capture=for_capture,
++                state_indices=(self._mamba_state_idx_gpu if self._align_mode else None),
++                num_accepted_tokens=self.num_accepted_tokens_gpu,
+             )
+         return attn_metadata
+ 
+@@ -373,12 +381,20 @@ class MambaHybridModelState(DefaultModelState):
+             raise RuntimeError("deferred RecoverSSM state without RecoverSSM")
+         self.recoverssm.restore_step(state)
+ 
++    # The RecoverSSM commit and the align postprocess (the "tail") can wait for
++    # the MTP proposal: the drafter is full attention and reads neither the GDN /
++    # conv state nor the mamba state indices / accepted counts they write.
++    supports_deferred_postprocess = True
++
+     def postprocess_state(
+         self,
+         idx_mapping: torch.Tensor,
+         num_sampled: torch.Tensor | int,
+         num_computed_tokens: torch.Tensor | None = None,
++        *,
++        defer_tail: bool = False,
+     ) -> None:
++        self.check_deferred_postprocess()
+         # Chunked prefill does not sample a token, so num_sampled can be 0.
+         # Mamba treats num_accepted_tokens=1 as the neutral non-spec value.
+         num_reqs = idx_mapping.shape[0]
+@@ -399,6 +415,62 @@ class MambaHybridModelState(DefaultModelState):
+                     max(num_sampled, 1),
+                 )
+ 
++        if defer_tail:
++            # Same arguments, same objects, run later on the same stream. The
++            # recorded RecoverSSM step is pinned so the flush can prove nothing
++            # re-recorded it in between.
++            self._deferred_tail = (
++                idx_mapping,
++                num_sampled,
++                num_computed_tokens,
++                None if self.recoverssm is None else self.recoverssm._step,
++            )
++            return
++        self._postprocess_tail(idx_mapping, num_sampled, num_computed_tokens)
++
++    def check_deferred_postprocess(self) -> None:
++        """Raise unless the previous step's deferred tail was enqueued. The
++        runner calls this before it mutates request state or builds metadata
++        for the next step: a pending tail (its step raised between postprocess
++        and flush) or a failed one means the next forward would read state the
++        commit has not written. Not recoverable: the runner stays poisoned."""
++        if self._deferred_tail_error is not None:
++            raise RuntimeError(
++                "RecoverSSM: a deferred postprocess tail failed "
++                f"({self._deferred_tail_error}); the GDN state is not committed"
++            )
++        if self._deferred_tail is not None:
++            raise RuntimeError(
++                "RecoverSSM: a deferred postprocess tail was never flushed"
++            )
++
++    def flush_deferred_postprocess(self) -> None:
++        if self._deferred_tail_error is not None:
++            self.check_deferred_postprocess()  # raises: already failed once
++        tail = self._deferred_tail
++        if tail is None:
++            return
++        idx_mapping, num_sampled, num_computed_tokens, step = tail
++        try:
++            if self.recoverssm is not None and self.recoverssm._step is not step:
++                raise RuntimeError(
++                    "RecoverSSM: the recorded step changed between postprocess "
++                    "and the deferred commit"
++                )
++            self._postprocess_tail(idx_mapping, num_sampled, num_computed_tokens)
++        except BaseException as e:
++            # Keep the marker: the state is mid-transition.
++            self._deferred_tail_error = f"{type(e).__name__}: {e}"
++            raise
++        self._deferred_tail = None
++
++    def _postprocess_tail(
++        self,
++        idx_mapping: torch.Tensor,
++        num_sampled: torch.Tensor | int,
++        num_computed_tokens: torch.Tensor | None,
++    ) -> None:
++        num_reqs = idx_mapping.shape[0]
+         if self.recoverssm is not None:
+             self.recoverssm.commit_step(
+                 num_sampled,
+diff --git a/v1/worker/gpu/model_states/recoverssm.py b/v1/worker/gpu/model_states/recoverssm.py
+index 2aafa25972..0af71bbe3f 100644
+--- a/v1/worker/gpu/model_states/recoverssm.py
++++ b/v1/worker/gpu/model_states/recoverssm.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++from collections.abc import Sequence
+ from dataclasses import dataclass
+ from typing import Any
+ 
+@@ -32,17 +33,26 @@ class RecoverSSMState:
+     """Coordinates RecoverSSM metadata between attention and postprocessing."""
+ 
+     def __init__(self) -> None:
++        from vllm.v1.worker.gpu.model_states.recoverssm_commit_graph import (
++            RecoverSSMCommitGraphs,
++        )
++
+         self._step: tuple[RecoverSSMMetadata, ...] | None = None
+         # True while `_step` is a restored PP-deferred step: its commit must
+         # skip rows whose request was freed since the verify (their state
+         # blocks may already belong to another request).
+         self._step_is_deferred = False
++        # Commit execution mode (eager | staged | graph) and the captured
++        # commit graphs. Default eager = the unchanged launch sequence below.
++        self._commit_graphs = RecoverSSMCommitGraphs(self._commit_groups)
+ 
+     def reset(self) -> None:
+         """Drop the recorded step. Its metadata holds the commit contexts, which
+-        reference the KV cache tensors they were built for."""
++        reference the KV cache tensors they were built for (so do the captured
++        commit graphs: drop them too)."""
+         self._step = None
+         self._step_is_deferred = False
++        self._commit_graphs.reset()
+ 
+     def detach_step(self) -> DeferredRecoverSSMStep | None:
+         """Take this step's commits for a deferred (non-last PP rank) commit.
+@@ -79,17 +89,28 @@ class RecoverSSMState:
+         attn_groups: list[list[AttentionGroup]],
+         *,
+         for_capture: bool,
++        state_indices: torch.Tensor | None = None,
++        num_accepted_tokens: torch.Tensor | None = None,
+     ) -> None:
+-        if for_capture:
+-            self._step = None
+-            return
+-
+         step: list[RecoverSSMMetadata] = []
+         for group_list in attn_groups:
+             for group in group_list:
+                 metadata = attn_metadata[group.layer_names[0]]
+                 if isinstance(metadata, RecoverSSMMetadata):
+                     step.append(metadata)
++        if for_capture:
++            # FULL forward capture (engine capture phase, quiescent): capture the
++            # commit chain for this dummy decode batch's request count. The
++            # running-state column and accepted counts are the model state's
++            # persistent buffers, the same ones every serving commit gets.
++            self._step = None
++            if num_accepted_tokens is not None:
++                self._commit_graphs.capture_warmup(
++                    tuple(step),
++                    state_indices=state_indices,
++                    num_accepted_tokens=num_accepted_tokens,
++                )
++            return
+         self._step = tuple(step)
+ 
+     def commit_step(
+@@ -121,8 +142,44 @@ class RecoverSSMState:
+                 idx_mapping >= 0, num_sampled, torch.zeros_like(num_sampled)
+             )
+ 
+-        for metadata in step:
+-            postprocess_meta = metadata.commit_recoverssm_state(num_sampled)
++        if not deferred and self._commit_graphs.run(
++            step,
++            num_sampled,
++            idx_mapping,
++            state_indices=state_indices,
++            num_accepted_tokens=num_accepted_tokens,
++        ):
++            return
++        self._commit_groups(
++            step,
++            num_sampled,
++            idx_mapping,
++            state_indices=state_indices,
++            num_accepted_tokens=num_accepted_tokens,
++        )
++
++    @staticmethod
++    def _commit_groups(
++        step: tuple[RecoverSSMMetadata, ...],
++        num_sampled: torch.Tensor,
++        idx_mapping: torch.Tensor,
++        *,
++        state_indices: torch.Tensor | None,
++        num_accepted_tokens: torch.Tensor,
++        num_computed_tokens: Sequence[torch.Tensor | None] | None = None,
++    ) -> None:
++        """The commit chain of one step: every group's commit (plan, conv
++        compaction, final and boundary folds), each followed by its align
++        postprocess. The eager path calls it with the step's own tensors; the
++        staged and graph paths with staged copies (``num_computed_tokens``: one
++        per group, replacing the metadata's align count tensor)."""
++        for i, metadata in enumerate(step):
++            if num_computed_tokens is None or num_computed_tokens[i] is None:
++                postprocess_meta = metadata.commit_recoverssm_state(num_sampled)
++            else:
++                postprocess_meta = metadata.commit_recoverssm_state(  # type: ignore[call-arg]
++                    num_sampled, num_computed_tokens=num_computed_tokens[i]
++                )
+             if postprocess_meta is None:
+                 continue
+             assert state_indices is not None
+diff --git a/v1/worker/gpu/model_states/recoverssm_commit_graph.py b/v1/worker/gpu/model_states/recoverssm_commit_graph.py
+new file mode 100644
+index 0000000000..1a086fef5a
+--- /dev/null
++++ b/v1/worker/gpu/model_states/recoverssm_commit_graph.py
+@@ -0,0 +1,565 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""RecoverSSM post-sampling commit as a standalone CUDA graph.
++
++The commit chain of one decode step (per GDN group: plan, conv compaction, final
++fold, boundary fold, align postprocess) runs after sampling, outside the forward
++graph. Eagerly that is 5 Triton launches per group plus their Python checks. This
++module replays the SAME chain from a CUDA graph: same kernels, same grids, same
++arguments, same order, on the same stream, so the committed state is bit-identical
++to the eager chain. The chain is rank-local (no collectives), so a rank replaying
++while another runs eagerly changes timing only.
++
++Modes (``VLLM_RECOVERSSM_COMMIT_GRAPH``, flippable at runtime through the worker
++method ``set_recoverssm_commit_mode``):
++
++- ``eager``  (default): the unchanged launch sequence, nothing staged, and no
++  commit graph is captured at boot.
++- ``staged``: copy the pointer-unstable inputs into persistent staging buffers,
++  then run the chain eagerly on them. The control arm: it does everything the graph
++  arm does except the replay.
++- ``graph``: stage, then replay the graph captured for this step's key.
++
++Graphs are captured ONLY in the engine's CUDA-graph capture phase (quiescent: no
++request is in flight, so no output thread is issuing CUDA work), from the dummy
++uniform-decode metadata of each FULL forward capture, in ``global`` capture mode.
++That happens when the boot-time mode is ``staged`` or ``graph`` (a process booted
++in ``eager`` has no graphs; flipping it to ``graph`` runs staged-eager). Serving
++never captures: a step whose key was not captured runs staged-eager. Capture
++errors propagate (the boot fails loudly); only a step that is not eligible is
++skipped, before any capture API is called.
++
++A step is graph-eligible only when it is a uniform all-decode RecoverSSM step:
++every recorded metadata is GDN RecoverSSM with a commit, all groups have the same
++``n`` spec rows, ``n`` equals the batch's request count, and the spec rows are
++0..n-1 (no request mapping). Everything else (prefill/mixed batches, PP-deferred
++commits, other RecoverSSM backends, an uncaptured key) runs an eager chain. Fail
++closed: never replay a graph whose recorded addresses are not exactly the current
++step's tensors.
++
++Staged inputs (fresh tensors every step): the sampler's ``num_sampled``, the
++batch's ``idx_mapping`` and each group's align ``num_computed_tokens``. Every
++other tensor the chain reads is passed through and pinned by the key (builder-
++staged spec state indices and query offsets, the persistent block-table slice,
++the mamba running-state column and accepted counts: data pointer, dtype, strides,
++the shape entries the launches use) or, for the commit context, by its identity:
++the context is a frozen dataclass (no field can be rebound), and the addresses of
++every context tensor a launch takes as an argument are re-checked before each
++replay."""
++
++from __future__ import annotations
++
++import os
++from collections.abc import Callable, Sequence
++from dataclasses import dataclass, field
++from typing import Any
++
++import torch
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++ENV_NAME = "VLLM_RECOVERSSM_COMMIT_GRAPH"
++COMMIT_MODES = ("eager", "staged", "graph")
++_MODE_ALIASES = {
++    "": "eager",
++    "0": "eager",
++    "eager": "eager",
++    "staged": "staged",
++    "1": "graph",
++    "graph": "graph",
++}
++# Dtypes of the serving-time staged sources, assumed by the warmup capture: the
++# rejection sampler's num_sampled (rejection_sampler_utils, new_empty int32) and
++# idx_mapping (async_tensor_h2d of an np.intp array). A serving step with other
++# dtypes has a different key and runs staged-eager.
++NUM_SAMPLED_DTYPE = torch.int32
++IDX_MAPPING_DTYPE = torch.int64
++
++
++def parse_commit_mode(value: str | None) -> str:
++    """Map an env/RPC value to a mode. Unknown values raise: a typo must not
++    silently run a different arm."""
++    key = "" if value is None else str(value).strip().lower()
++    if key not in _MODE_ALIASES:
++        raise ValueError(
++            f"{ENV_NAME}: unknown RecoverSSM commit mode {value!r} "
++            f"(expected one of {COMMIT_MODES} or 0/1)"
++        )
++    return _MODE_ALIASES[key]
++
++
++_mode: str | None = None
++
++
++def get_commit_mode() -> str:
++    global _mode
++    if _mode is None:
++        import vllm.envs as envs
++
++        _mode = parse_commit_mode(envs.VLLM_RECOVERSSM_COMMIT_GRAPH)
++    return _mode
++
++
++def set_commit_mode(mode: str) -> str:
++    """Set the process-wide commit mode; takes effect at the next commit."""
++    global _mode
++    new = parse_commit_mode(mode)
++    old = get_commit_mode()
++    _mode = new
++    if new != old:
++        logger.info("[recoverssm-commit] mode=%s (was %s)", new, old)
++    return new
++
++
++@dataclass
++class CommitGraphStats:
++    eager_steps: int = 0  # mode eager, or ineligible in staged/graph mode
++    staged_steps: int = 0  # staged-eager runs (staged mode, or uncaptured key)
++    replays: int = 0
++    captures: int = 0
++    fallbacks: dict[str, int] = field(default_factory=dict)
++
++    def fallback(self, reason: str) -> None:
++        self.fallbacks[reason] = self.fallbacks.get(reason, 0) + 1
++
++
++_stats = CommitGraphStats()
++
++
++def commit_stats() -> dict[str, Any]:
++    return {
++        "mode": get_commit_mode(),
++        "pid": os.getpid(),
++        "device": torch.cuda.current_device() if torch.cuda.is_available() else None,
++        "eager_steps": _stats.eager_steps,
++        "staged_steps": _stats.staged_steps,
++        "replays": _stats.replays,
++        "captures": _stats.captures,
++        "fallbacks": dict(_stats.fallbacks),
++    }
++
++
++def _tsig(t: torch.Tensor | None, *, shape_dims: tuple[int, ...] = ()) -> Any:
++    """What a captured launch bakes in from a pass-through tensor: its address,
++    dtype, strides and the listed shape entries (the ones passed as launch args)."""
++    if t is None:
++        return None
++    return (
++        t.data_ptr(),
++        t.dtype,
++        t.device,
++        tuple(t.stride()),
++        tuple(t.shape[d] for d in shape_dims),
++    )
++
++
++def context_bound_tensors(ctx: Any) -> tuple[torch.Tensor, ...]:
++    """The context tensors the commit launches take as arguments (the per-layer
++    tensors are reached only through the address tables, on device, by both the
++    eager and the replayed chain)."""
++    return (
++        ctx.conv_states[0],
++        ctx.conv_state_base_addrs,
++        ctx.conv_state_block_strides,
++        ctx.conv_state_dim_strides,
++        ctx.conv_state_token_strides,
++        ctx.checkpoints[0],
++        ctx.state_base_addrs,
++        ctx.state_block_strides,
++        ctx.replays[0],
++        ctx.replay_base_addrs,
++        ctx.replay_block_strides,
++        ctx.commit_lens,
++        ctx.final_state_indices,
++        ctx.boundary_state_indices,
++        ctx.boundary_recovery_lens,
++    )
++
++
++def _context_ptrs(ctx: Any) -> tuple[int, ...]:
++    return tuple(t.data_ptr() for t in context_bound_tensors(ctx))
++
++
++@dataclass
++class _Plan:
++    """One eligible step, resolved: the key, and what to stage."""
++
++    n: int
++    key: tuple
++    # Per group: staging slot of its num_computed_tokens (None: not align).
++    nc_slots: tuple[int | None, ...]
++    nc_sources: list[torch.Tensor]  # one per slot
++    contexts: tuple[Any, ...]
++
++
++@dataclass
++class _Entry:
++    graph: Any  # torch.cuda.CUDAGraph
++    # Everything whose address the graph recorded, kept alive with it: the
++    # contexts, the staging buffers and the pass-through tensors of the step it
++    # was captured from.
++    contexts: tuple[Any, ...]
++    staging: tuple[torch.Tensor, ...]
++    bindings: tuple[Any, ...]
++    # Per context, the addresses of every tensor a launch takes as an argument,
++    # as the context's fields held them at capture; the fields are re-read and
++    # compared before each replay.
++    context_ptrs: tuple[tuple[int, ...], ...]
++
++
++class RecoverSSMCommitGraphs:
++    """Stages, captures (at warmup) and replays the RecoverSSM commit chain."""
++
++    def __init__(self, launch: Callable[..., None]) -> None:
++        # launch(step, num_sampled, idx_mapping, *, state_indices,
++        #        num_accepted_tokens, num_computed_tokens) -> None
++        self._launch = launch
++        self._graphs: dict[tuple, _Entry] = {}
++        self._staging: dict[tuple, torch.Tensor] = {}
++        self._capture_stream: torch.cuda.Stream | None = None
++        self._logged_replay = False
++        self._logged_uncaptured = False
++        self._contexts: tuple[Any, ...] | None = None  # of the last eligible step
++        self._require_cuda = True  # CPU unit tests of the eligibility rules clear it
++        # Read the mode now: a bad env value fails the boot, not the first step.
++        # The boot-time mode decides whether warmup captures graphs.
++        self.capture_at_warmup = get_commit_mode() != "eager"
++
++    # -- lifecycle -------------------------------------------------------------
++
++    def reset(self) -> None:
++        """Drop every graph and staging buffer (KV cache teardown/re-allocation:
++        the graphs hold addresses inside the old cache)."""
++        self._graphs.clear()
++        self._staging.clear()
++        self._contexts = None
++
++    @property
++    def num_graphs(self) -> int:
++        return len(self._graphs)
++
++    # -- eligibility -----------------------------------------------------------
++
++    def _plan(
++        self,
++        step: Sequence[Any],
++        num_sampled: torch.Tensor,
++        idx_mapping: torch.Tensor,
++        state_indices: torch.Tensor | None,
++        num_accepted_tokens: torch.Tensor,
++    ) -> _Plan | str:
++        """The step's key and staging plan, or the reason it is not eligible."""
++        from vllm.v1.attention.backends.gdn_recoverssm import GDNRecoverSSMMetadata
++
++        if not step:
++            return "empty_step"
++        if not isinstance(num_sampled, torch.Tensor) or num_sampled.ndim != 1:
++            return "num_sampled"
++        if idx_mapping.ndim != 1:
++            return "idx_mapping"
++        num_reqs = idx_mapping.shape[0]
++        if num_reqs == 0 or num_sampled.shape[0] < num_reqs:
++            return "num_sampled"
++        dev = num_sampled.device
++        if idx_mapping.device != dev:
++            return "device"
++        group_sigs = []
++        nc_slots: list[int | None] = []
++        nc_sources: list[torch.Tensor] = []
++        nc_ptrs: dict[tuple, int] = {}
++        contexts = []
++        for m in step:
++            if type(m) is not GDNRecoverSSMMetadata:
++                return "metadata_type"
++            c = m.recoverssm_commit
++            ctx = m.recoverssm_context
++            if c is None or ctx is None:
++                return "no_commit"
++            n = m.num_spec_decodes
++            if n != num_reqs:
++                return "not_uniform_decode"
++            if c.request_indices is not None:
++                return "request_indices"
++            if (
++                c.state_indices.ndim != 2
++                or c.state_indices.shape[0] < n
++                or c.query_start_loc.ndim != 1
++                or c.query_start_loc.shape[0] < n + 1
++            ):
++                return "commit_shape"
++            if n > ctx.commit_lens.shape[0]:
++                return "capacity"
++            nc = c.num_computed_tokens
++            slot = None
++            if nc is not None:
++                if nc.ndim != 1 or nc.shape[0] < n or nc.device != dev:
++                    return "num_computed_tokens"
++                k = (nc.data_ptr(), nc.dtype, tuple(nc.stride()))
++                if k not in nc_ptrs:
++                    nc_ptrs[k] = len(nc_sources)
++                    nc_sources.append(nc)
++                slot = nc_ptrs[k]
++            nc_slots.append(slot)
++            contexts.append(ctx)
++            group_sigs.append(
++                (
++                    id(ctx),
++                    n,
++                    _tsig(c.state_indices),
++                    _tsig(c.query_start_loc),
++                    _tsig(c.block_table, shape_dims=(1,)),
++                    c.block_size,
++                    None if nc is None else (slot, nc.dtype),
++                )
++            )
++        if any(s is not None for s in nc_slots) and state_indices is None:
++            return "state_indices"
++        if dev.type != "cuda" and self._require_cuda:
++            return "device"
++        key = (
++            num_reqs,
++            num_sampled.dtype,
++            idx_mapping.dtype,
++            dev,
++            _tsig(state_indices),
++            _tsig(num_accepted_tokens),
++            tuple(group_sigs),
++        )
++        return _Plan(num_reqs, key, tuple(nc_slots), nc_sources, tuple(contexts))
++
++    # -- staging ---------------------------------------------------------------
++
++    def _buffer(self, name: str, dtype: torch.dtype, dev: torch.device, cap: int):
++        k = (name, dtype, dev)
++        buf = self._staging.get(k)
++        if buf is None or buf.shape[0] < cap:
++            # A captured graph reads the old buffer's address: drop them all.
++            self._graphs.clear()
++            buf = torch.zeros(cap, dtype=dtype, device=dev)
++            self._staging[k] = buf
++        return buf
++
++    def _stage(
++        self,
++        plan: _Plan,
++        num_sampled: torch.Tensor,
++        idx_mapping: torch.Tensor,
++    ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
++        """Copy the step's pointer-unstable inputs into the staging buffers (same
++        stream as the commit, so the next step's copies are ordered after it)."""
++        n = plan.n
++        dev = num_sampled.device
++        cap = max(int(ctx.commit_lens.shape[0]) for ctx in plan.contexts)
++        ns = self._buffer("num_sampled", num_sampled.dtype, dev, cap)[:n]
++        im = self._buffer("idx_mapping", idx_mapping.dtype, dev, cap)[:n]
++        ncs = [
++            self._buffer(f"num_computed_{i}", src.dtype, dev, cap)[:n]
++            for i, src in enumerate(plan.nc_sources)
++        ]
++        dst = [ns, im, *ncs]
++        src = [num_sampled[:n], idx_mapping[:n], *(s[:n] for s in plan.nc_sources)]
++        # One fused launch per dtype group where the foreach kernel applies.
++        by_dtype: dict[torch.dtype, tuple[list, list]] = {}
++        for d, s in zip(dst, src):
++            if d.dtype != s.dtype:
++                raise AssertionError("staging dtype mismatch")
++            by_dtype.setdefault(d.dtype, ([], []))
++            by_dtype[d.dtype][0].append(d)
++            by_dtype[d.dtype][1].append(s)
++        for ds, ss in by_dtype.values():
++            if len(ds) == 1:
++                ds[0].copy_(ss[0], non_blocking=True)
++            else:
++                torch._foreach_copy_(ds, ss, non_blocking=True)
++        return ns, im, ncs
++
++    def _staged_args(self, plan: _Plan, ncs: list[torch.Tensor]):
++        return [None if s is None else ncs[s] for s in plan.nc_slots]
++
++    def _check_contexts(self, plan: _Plan) -> None:
++        last = self._contexts
++        if (
++            last is None
++            or len(last) != len(plan.contexts)
++            or any(a is not b for a, b in zip(last, plan.contexts))
++        ):
++            # New commit contexts (re-created builders / KV cache): graphs of the
++            # old ones are dead and would keep the old cache alive.
++            self._graphs.clear()
++            self._contexts = plan.contexts
++
++    # -- warmup capture --------------------------------------------------------
++
++    def capture_warmup(
++        self,
++        step: Sequence[Any],
++        *,
++        state_indices: torch.Tensor | None,
++        num_accepted_tokens: torch.Tensor,
++    ) -> bool:
++        """Capture the commit chain for one FULL forward capture's dummy decode
++        metadata. Called from the engine's CUDA-graph capture phase, outside any
++        forward capture. Returns False when the step is not eligible (checked
++        before any capture API is touched); every capture error propagates."""
++        if not self.capture_at_warmup or not step:
++            return False
++        ctx0 = getattr(step[0], "recoverssm_context", None)
++        if ctx0 is None or not hasattr(ctx0, "commit_lens"):
++            return False
++        dev = ctx0.commit_lens.device
++        n = getattr(step[0], "num_spec_decodes", 0)
++        if n <= 0:
++            return False
++        # Stand-ins for the serving-time sources, valued so the warm-up run is a
++        # no-op on persistent state: 0 accepted tokens makes every commit length
++        # 0 (no fold, no conv write), idx -1 makes the align postprocess skip.
++        ns_src = torch.zeros(n, dtype=NUM_SAMPLED_DTYPE, device=dev)
++        im_src = torch.full((n,), -1, dtype=IDX_MAPPING_DTYPE, device=dev)
++        plan = self._plan(step, ns_src, im_src, state_indices, num_accepted_tokens)
++        if isinstance(plan, str):
++            _stats.fallback("warmup_" + plan)
++            return False
++        self._check_contexts(plan)
++        if plan.key in self._graphs:
++            return False
++        ns, im, ncs = self._stage(plan, ns_src, im_src)
++        args = dict(
++            state_indices=state_indices,
++            num_accepted_tokens=num_accepted_tokens,
++            num_computed_tokens=self._staged_args(plan, ncs),
++        )
++        # JIT warm-up with the exact arguments the capture records.
++        self._launch(step, ns, im, **args)
++        graph = self._capture_graph(dev, step, ns, im, args)
++        bindings = tuple(
++            t
++            for m in step
++            for t in (
++                m.recoverssm_commit.state_indices,
++                m.recoverssm_commit.query_start_loc,
++                m.recoverssm_commit.block_table,
++            )
++            if t is not None
++        ) + tuple(t for t in (state_indices, num_accepted_tokens) if t is not None)
++        bindings += tuple(
++            t for ctx in plan.contexts for t in context_bound_tensors(ctx)
++        )
++        context_ptrs = tuple(_context_ptrs(ctx) for ctx in plan.contexts)
++        self._graphs[plan.key] = _Entry(
++            graph, plan.contexts, (ns, im, *ncs), bindings, context_ptrs
++        )
++        _stats.captures += 1
++        logger.info(
++            "[recoverssm-commit] captured commit graph n=%d at warmup (%d total)",
++            plan.n,
++            len(self._graphs),
++        )
++        return True
++
++    def _capture_graph(self, dev, step, ns, im, args):
++        """Record the chain (no execution). Errors propagate: torch's
++        capture_end ends the allocator's pool routing before it raises
++        (CUDAGraph.cpp, torch 2.13), and the boot should fail loudly anyway."""
++        if self._capture_stream is None:
++            self._capture_stream = torch.cuda.Stream(device=dev)
++        side = self._capture_stream
++        torch.cuda.synchronize(dev)
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.stream(side):
++            # Private pool (nothing in the chain allocates); global mode: the
++            # capture phase is quiescent, so any other CUDA work is an error.
++            graph.capture_begin(capture_error_mode="global")
++            try:
++                self._launch(step, ns, im, **args)
++            finally:
++                graph.capture_end()
++        torch.cuda.synchronize(dev)
++        return graph
++
++    # -- serving ---------------------------------------------------------------
++
++    def run(
++        self,
++        step: Sequence[Any],
++        num_sampled: torch.Tensor,
++        idx_mapping: torch.Tensor,
++        *,
++        state_indices: torch.Tensor | None,
++        num_accepted_tokens: torch.Tensor,
++    ) -> bool:
++        """Commit the step in staged or graph mode. False: the caller runs the
++        eager chain (eager mode, or the step is not eligible). Never captures."""
++        mode = get_commit_mode()
++        if mode == "eager":
++            _stats.eager_steps += 1
++            return False
++        plan = self._plan(
++            step, num_sampled, idx_mapping, state_indices, num_accepted_tokens
++        )
++        if isinstance(plan, str):
++            _stats.eager_steps += 1
++            _stats.fallback(plan)
++            return False
++        self._check_contexts(plan)
++        ns, im, ncs = self._stage(plan, num_sampled, idx_mapping)
++        if mode == "graph":
++            entry = self._graphs.get(plan.key)
++            if entry is not None and (
++                any(
++                    a.data_ptr() != b.data_ptr()
++                    for a, b in zip(entry.staging, (ns, im, *ncs), strict=True)
++                )
++                or any(
++                    _context_ptrs(ctx) != ptrs
++                    for ctx, ptrs in zip(entry.contexts, entry.context_ptrs)
++                )
++            ):
++                _stats.fallback("binding_moved")
++                del self._graphs[plan.key]
++                entry = None
++            if entry is not None:
++                entry.graph.replay()
++                _stats.replays += 1
++                if not self._logged_replay:
++                    self._logged_replay = True
++                    logger.info(
++                        "[recoverssm-commit] mode=graph captured=%d (device %s, "
++                        "first replay n=%d)",
++                        len(self._graphs),
++                        ns.device,
++                        plan.n,
++                    )
++                return True
++            _stats.fallback("not_captured")
++            if not self._logged_uncaptured:
++                self._logged_uncaptured = True
++                logger.info(
++                    "[recoverssm-commit] mode=graph: no graph for this step "
++                    "(n=%d, %d captured); running staged-eager",
++                    plan.n,
++                    len(self._graphs),
++                )
++        # Staged-eager: the real commit of this step on the staged buffers.
++        self._launch(
++            step,
++            ns,
++            im,
++            state_indices=state_indices,
++            num_accepted_tokens=num_accepted_tokens,
++            num_computed_tokens=self._staged_args(plan, ncs),
++        )
++        _stats.staged_steps += 1
++        return True
++
++
++__all__ = [
++    "COMMIT_MODES",
++    "ENV_NAME",
++    "RecoverSSMCommitGraphs",
++    "commit_stats",
++    "get_commit_mode",
++    "parse_commit_mode",
++    "set_commit_mode",
++]
+diff --git a/v1/worker/gpu/recoverssm_order.py b/v1/worker/gpu/recoverssm_order.py
+new file mode 100644
+index 0000000000..19353a3e5b
+--- /dev/null
++++ b/v1/worker/gpu/recoverssm_order.py
+@@ -0,0 +1,88 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Eligibility of VLLM_RECOVERSSM_COMMIT_AFTER_PROPOSE (the RecoverSSM GDN
++commit enqueued after the MTP proposal). Kept free of the runner so it can be
++tested without the CUDA stack."""
++
++from typing import Any
++
++from vllm.v1.kv_cache_interface import MambaSpec
++
++
++def commit_after_propose_eligibility(
++    speculator: Any, model_state: Any, pp_handler: Any, pcp_manager: Any
++) -> tuple[bool, str]:
++    """(eligible, reason). Eligible only when the proposal provably cannot read
++    what the deferred tail writes or write what it reads:
++
++    - a RecoverSSM model state that supports the deferral;
++    - no PP (non-last ranks defer their commits differently);
++    - no PCP (the proposal re-gathers the batch-order block tables, a commit
++      input);
++    - a model-based drafter with an INITIALIZED attention-group inventory
++      (``set_attn`` ran) in which no group holds Mamba/GDN state. A missing,
++      empty or differently shaped inventory is not evidence of safety."""
++    if speculator is None:
++        return False, "no speculator"
++    if pp_handler is not None:
++        return False, "pipeline parallelism"
++    if pcp_manager is not None:
++        return False, "prefill context parallelism"
++    if getattr(model_state, "recoverssm", None) is None:
++        return False, "RecoverSSM is off"
++    if not getattr(model_state, "supports_deferred_postprocess", False):
++        return False, "model state cannot defer its postprocess"
++    groups = getattr(speculator, "attn_groups", None)
++    if not isinstance(groups, list) or not groups:
++        return False, "drafter attention groups not initialized"
++    seen = 0
++    for group_list in groups:
++        if not isinstance(group_list, list):
++            return False, "unrecognized drafter attention-group inventory"
++        for group in group_list:
++            seen += 1
++            spec = getattr(group, "kv_cache_spec", None)
++            if spec is None:
++                return False, "drafter attention group without a KV cache spec"
++            if isinstance(spec, MambaSpec):
++                return False, "drafter holds Mamba/GDN state"
++    if not seen:
++        return False, "drafter attention groups not initialized"
++    return True, "active"
++
++
++class CommitAfterProposeGate:
++    """Caches the eligibility verdict per (drafter attention-group inventory,
++    PP handler, PCP manager) identity: a drafter ``set_attn`` re-run (KV cache
++    re-initialization) or a changed parallel setup re-evaluates it."""
++
++    def __init__(self, logger: Any) -> None:
++        self._logger = logger
++        self._key: tuple[Any, ...] | None = None
++        self._ok = False
++
++    def eligible(
++        self, speculator: Any, model_state: Any, pp_handler: Any, pcp_manager: Any
++    ) -> bool:
++        key = (
++            None if speculator is None else getattr(speculator, "attn_groups", None),
++            model_state,
++            pp_handler,
++            pcp_manager,
++        )
++        if self._key is not None and all(a is b for a, b in zip(self._key, key)):
++            return self._ok
++        ok, reason = commit_after_propose_eligibility(
++            speculator, model_state, pp_handler, pcp_manager
++        )
++        self._key, self._ok = key, ok
++        if ok:
++            self._logger.info(
++                "RecoverSSM commit after propose: active (GDN commit and align "
++                "postprocess enqueued after the MTP proposal, same stream)"
++            )
++        else:
++            self._logger.warning(
++                "VLLM_RECOVERSSM_COMMIT_AFTER_PROPOSE=1 ignored: %s", reason
++            )
++        return ok
+diff --git a/v1/worker/gpu_worker.py b/v1/worker/gpu_worker.py
+index 8cb9d18d2e..dff16c4e29 100644
+--- a/v1/worker/gpu_worker.py
++++ b/v1/worker/gpu_worker.py
+@@ -1226,6 +1226,22 @@ class Worker(WorkerBase):
+         """Get encoder timing stats from model runner."""
+         return self.model_runner.get_encoder_timing_stats()
+ 
++    def set_recoverssm_commit_after_propose(self, enabled: bool) -> dict[str, Any]:
++        """Switch VLLM_RECOVERSSM_COMMIT_AFTER_PROPOSE in this running process
++        (the commit-order A/B control; takes effect at the next sampled step,
++        whose deferral is self-contained). Reachable via the dev-mode
++        /collective_rpc endpoint. Returns the request, whether this rank can
++        defer, and how many steps it has deferred so far."""
++        runner = self.model_runner
++        if not hasattr(runner, "_recoverssm_commit_after_propose"):
++            raise RuntimeError("RecoverSSM commit order needs the V2 model runner")
++        runner._recoverssm_commit_after_propose = bool(enabled)
++        return {
++            "commit_after_propose": bool(enabled),
++            "eligible": runner._recoverssm_can_defer() if enabled else None,
++            "deferred_steps": runner._recoverssm_deferred_steps,
++        }
++
+     def annotate_profile(self, scheduler_output):
+         # add trace annotation so that we can easily distinguish
+         # context/generation request numbers in each iteration.
+@@ -1537,6 +1553,26 @@ class Worker(WorkerBase):
+         # worker will always be healthy as long as it's running.
+         return
+ 
++    def set_recoverssm_commit_mode(self, mode: str) -> dict[str, Any]:
++        """Switch the RecoverSSM post-sampling commit between eager, staged and
++        graph in this running process (the A/B control; takes effect at the next
++        commit). Reachable via the dev-mode /collective_rpc endpoint. Returns the
++        commit counters, so the caller sees the previous arm's totals."""
++        from vllm.v1.worker.gpu.model_states.recoverssm_commit_graph import (
++            commit_stats,
++            set_commit_mode,
++        )
++
++        set_commit_mode(mode)
++        return commit_stats()
++
++    def get_recoverssm_commit_stats(self) -> dict[str, Any]:
++        from vllm.v1.worker.gpu.model_states.recoverssm_commit_graph import (
++            commit_stats,
++        )
++
++        return commit_stats()
++
+     def save_sharded_state(
+         self,
+         path: str,

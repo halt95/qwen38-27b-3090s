@@ -1,0 +1,11 @@
+# Build tools for the editable engine install (vLLM's setup.py imports setuptools-rust/-scm; no build isolation).
+# Same versions as Flash-Next upstream/PIN-v2.5 build_tools. Hash-locked; installed with --no-deps because their
+# runtime dependencies (setuptools 80.10.2, packaging 26.3) are already hash-locked in requirements-pinned.txt.
+setuptools-rust==1.13.0 \
+    --hash=sha256:666439c4d90e968bb625bcf87ec0aa02b4f49e599d2f5dc255c633a04e8eca99
+setuptools-scm==10.3.4 \
+    --hash=sha256:82f34c3e3084fc2b57d397200637cc13f2338004052d2fee47baa5f0e902464e
+vcs-versioning==2.5.0 \
+    --hash=sha256:dbf44f6303dc817e5792cb7d0e9cc90e3046ee1e32eaa357b20ad368811313d0
+semantic-version==2.10.0 \
+    --hash=sha256:de78a3b8e0feda74cabc54aab2da702113e33ac9d9eb9d2389bcf1f58b7d9177

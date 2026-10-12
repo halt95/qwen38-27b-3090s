@@ -1,0 +1,21 @@
+diff --git a/v1/qwen35_series.py b/v1/qwen35_series.py
+index 141292c67d..d2d4b51ab0 100644
+--- a/v1/qwen35_series.py
++++ b/v1/qwen35_series.py
+@@ -22,5 +22,15 @@ def series_active(vllm_config) -> bool:
+         return False
+     from vllm.platforms import current_platform
+ 
+-    cap = current_platform.get_device_capability()
++    # Ask about the device this process runs on, not visible device 0 (they differ on
++    # a worker bound to a later card of a mixed-GPU host).
++    device_id = 0
++    try:
++        import torch
++
++        if torch.cuda.is_available() and torch.cuda.is_initialized():
++            device_id = torch.cuda.current_device()
++    except Exception:
++        device_id = 0
++    cap = current_platform.get_device_capability(device_id=device_id)
+     return cap is not None and cap.to_int() == 86

@@ -1,27 +1,57 @@
 # Package manifest
 
-Every file in this repository except this manifest and `release/SHA256SUMS`, with its Git
+Every file in the package except this manifest and `release/SHA256SUMS`, with its Git
 mode, size in bytes and SHA-256 of the committed bytes. `release/SHA256SUMS` covers this
 manifest too. Checkpoint files are listed in `release/checkpoint.sha256`.
 
 | file | mode | bytes | sha256 |
 |---|---|---:|---|
-| `.dockerignore` | 100644 | 515 | `5e7f25ebd5848472e2b9ebae1008b5578d40595c83288a11d0dab275d3aa9dc7` |
-| `.gitattributes` | 100644 | 210 | `28f6a02ec2d74085a3ccceb3ece67d3f4051a823db9ea474f039f4b30b7c1493` |
+| `.gitattributes` | 100644 | 106 | `af62b493c1666c0dff611abee66b4feea058e416f758b73ef6945029411896a1` |
 | `.gitignore` | 100644 | 32 | `81b54bd26992a95306b15f8edd81a854ea95b20a2a80c2fa7ebcff5b04e06b48` |
-| `CHANGELOG.md` | 100644 | 1824 | `55b15830bc5303b97c8b3a52ec29fdd7245c09b2cef712b18b4eba0a37e6b875` |
-| `Dockerfile` | 100644 | 6521 | `9d475ff8ad905cda8ebd2131d384b8e873e0257130a4da00602f9b87fac62105` |
+| `CHANGELOG.md` | 100644 | 13024 | `47b10400fd19c626cf51e54964dc3f5ce50c946e1029138946f4f580d0b522f2` |
 | `LICENSE` | 100644 | 11358 | `cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30` |
-| `NOTICE` | 100644 | 1944 | `ab2e0daa60fa83c4586af7b1453e96dfa1a98985670c149eceb5d6ffe59db57a` |
-| `README.md` | 100644 | 45244 | `52437ec4132bbd5f20d017fc0c69a4aa11ecd9fdc8098bcce751e4a91371a139` |
+| `NOTICE` | 100644 | 7538 | `c7818395ceb8d30250e5b56314cc4311648cdd0b50adcd285ceb7edcd3e52088` |
+| `README.md` | 100644 | 23269 | `0247f542232e53a2de04bd362aaf5ccbf1e0ef5207bad3c08f4ed5480a040128` |
 | `benchmarks/2026-09-25/BENCH-CARD.md` | 100644 | 7750 | `d6d71056479509eab4147af96b9a603ee241691033fb87ddb3ffb1564187fef6` |
 | `benchmarks/2026-09-26/BENCH-CARD.md` | 100644 | 13155 | `88e2a5c64b7d5941eb4c989893f9f741407c55e1f3821c7ffab54c7dcfb509bf` |
 | `benchmarks/2026-09-26/qwen38-27b-v1.0.0-ctx-pp-tg-itl.png` | 100644 | 226596 | `46486ae333ab96c6747c3c5af6f4aac54b4003d069361aa307799d5f439c8664` |
-| `docker-compose.yml` | 100644 | 1821 | `698658a4519dd1de75161de1da6e9296cb2fbbb122fddbef3287825e91698806` |
+| `benchmarks/2026-10-12/BENCH-CARD.md` | 100644 | 27259 | `e985c40465264fac5519182d38da8d95183b654fa2c55d3037e1ba3e22e9b34c` |
+| `benchmarks/2026-10-12/ThinkingCap-BENCH-CARD.md` | 100644 | 18018 | `db98ea9c480b2d701b6d2ff3e65b999060b610d8660477392c62a8815971153d` |
+| `benchmarks/2026-10-12/qwen38-27b-v1.3.0-ctx-pp-tg-itl.png` | 100644 | 99809 | `a5ab2afed9c5fdd1a78672c7aaa3802756741c7120a668c24710243d6e753fb9` |
+| `benchmarks/2026-10-12/thinkingcap-v1.3.0-ctx-pp-tg-itl.png` | 100644 | 106345 | `07bd5f24828ad58d946794399eb8d15569a7fea5ca480537f023feedb3808400` |
+| `docs/history.md` | 100644 | 3511 | `2ced16313d31f91cdf44930683ef374f267831fa50ce8a99fadd38069a334d3d` |
 | `docs/images/qwen38-27b-v1.0-layout.png` | 100644 | 210362 | `40cc79bd8072eccb470fc9e2ebfb65c840bef6ef82a63e941e7952e794013981` |
 | `docs/images/qwen38-27b-v1.0-long-prefill.png` | 100644 | 146769 | `64ebf2beb08ebd3af4f035c49263d0c7f03ca636b06f231e752638468bf535d0` |
 | `docs/images/qwen38-27b-v1.0-summary.png` | 100644 | 469639 | `90f19cd037e0f4aaa53f621308767410f40496da842524f91f0365ea1a9c8166` |
 | `docs/loop-check.md` | 100644 | 4313 | `f87ff1082e7f9a86e374ebcb3dc138d5c18749de439df255fc708376f8f60153` |
+| `docs/reference.md` | 100644 | 52240 | `58be5374e7821ee5b2a11d70f6b4cffaff1d5cb6586cf0db89d2710e22f5d7d7` |
+| `licenses/LICENSE-Apache-2.0-Qwen.txt` | 100644 | 11343 | `50cbab8a892c5f2993b8c7351a99182507472def3b1374558308605d99b86b32` |
+| `licenses/LICENSE-PolyForm-Small-Business-1.0.0.txt` | 100644 | 4389 | `03eea824bff13316b767424b3e8f49538b46e52d897aecc87d6344343364aa56` |
+| `licenses/ThinkingCap-LICENSE` | 100644 | 1260 | `b0c19e27d211f7b586e3ef3098af5c9e40fb2967ae6433ceacb73c624b011ee5` |
+| `licenses/ThinkingCap-NOTICE` | 100644 | 757 | `7f17c8641dc28f6c194578f58bf5ed3be9f1202823c6c2376ff1b1b95fa8e71c` |
+| `patches/flashinfer-0.6.18.post1/0001-sm8x-fp8-smallq-verify-tile.patch` | 100644 | 34923 | `52e661044c38b6c00005fc98fe3b17ce497a0fc787d022bdc982978cacbe4974` |
+| `patches/flashinfer-0.6.18.post1/README.md` | 100644 | 14593 | `e3f8be12f282362a86ea93257968f8b999cb15c1da4bb294ac1bcb7b0c63f8ab` |
+| `patches/flashinfer-0.6.18.post1/tests/test_0001_split_kv_merge.py` | 100644 | 18778 | `6aaa7b98639b6dd3f91a122f06ec5c137ade3f286ec6b6299f112bf5334243ab` |
+| `patches/merlin-engine-v2.5.2/0001-flashinfer-uniform-multi-token-decode.patch` | 100644 | 8299 | `cfec6a8474d90a79eaf809a1433e548442a48c8e459660fcd6a241e5f274bfa1` |
+| `patches/merlin-engine-v2.5.2/0002-flashinfer-decode-plan-cache.patch` | 100644 | 3959 | `5c48313d31bc82fb52dd83be10396b7cd90c57fd84a6e4bd3be54e7a8e32a138` |
+| `patches/merlin-engine-v2.5.2/0003-host-embed-table-dense-qwen35-default.patch` | 100644 | 5473 | `63eedf4a5cea1e35e71a2f7c47020281d1227aeb6d5ff324cf9f38d87166b867` |
+| `patches/merlin-engine-v2.5.2/0004-gdn-split-k-in-proj-ba.patch` | 100644 | 6550 | `028f0c44008db3f36a12e67d55ac626f2cdaf98fb5335aca086af0741a085405` |
+| `patches/merlin-engine-v2.5.2/0005-draft-seq-lens-nosync.patch` | 100644 | 8161 | `7a035a38d4121faedd443ae69b537817bd83e5823725544a5795d992607ea4d8` |
+| `patches/merlin-engine-v2.5.2/0006-plan-cache-fa2-guard-and-split-k-arch-gate.patch` | 100644 | 2127 | `2259486f918ee629525b65fb4e7da49f19416d00589eae75e4d5d2a27993002a` |
+| `patches/merlin-engine-v2.5.2/0007-family-isolation-and-audit-fixes.patch` | 100644 | 13423 | `696bfa4b8ceb78074ce361a1a78e4f26e92d3b73d9478074b924fa2a15ead135` |
+| `patches/merlin-engine-v2.5.2/0008-recoverssm-dense-qwen35.patch` | 100644 | 8827 | `ff5da67c662f634125df6e17c57d8388cd8e937baba33e7a7ab6ac3bb938e82a` |
+| `patches/merlin-engine-v2.5.2/0009-family-gate-executing-device.patch` | 100644 | 819 | `2745b54b3262a681f392fb0d310b22461e0c9e018a4ee5dbd86cbfbbd71edde4` |
+| `patches/merlin-engine-v2.5.2/0010-family-gate-fail-closed-and-draft-publish-after-build.patch` | 100644 | 7684 | `df1caad635ebc0654d1d28ce39bac3f4920685bc6a57188e51699d44a8fd8cc6` |
+| `patches/merlin-engine-v2.5.2/0011-recoverssm-commit-metadata-reuse-and-graph.patch` | 100644 | 68676 | `1635a196cdb792d468c7e7dd84b958212408a1bdd9400140c87c4837c48efa36` |
+| `patches/merlin-engine-v2.5.2/README.md` | 100644 | 12420 | `8c3679434bd1fd15f41018b9fe0e38bd3f9806c4f4b816c56542c4acaf09d577` |
+| `patches/merlin-engine-v2.5.2/tests/test_0010_draft_seq_lens_publish.py` | 100644 | 7653 | `461c25df3569a73d51529ace086ef360cbafb080bc13418a7f4edb776adc2731` |
+| `patches/merlin-engine-v2.5.2/tests/test_0010_series_gate_device.py` | 100644 | 6902 | `fc98f5bd45bfa4d4050ca3a8048e1afeca406eb4b54c2b1292f969e5b7eea2ce` |
+| `patches/merlin-engine-v2.5.2/tests/test_0011_commit_after_propose.py` | 100644 | 20227 | `558340605ae9619c3f492169ef9fe479bbfd3b2b94860a1bb0b068a51bfe5e30` |
+| `patches/merlin-engine-v2.5.2/tests/test_0011_commit_equivalence.py` | 100644 | 10670 | `42bce806d44496cf4479e9208b6a3f6daaecfff7502b11090da2d17dbea2c574` |
+| `patches/merlin-engine-v2.5.2/tests/test_0011_commit_graph.py` | 100644 | 34019 | `92abc69969f41bd88e512831cbfcb53251ecdc3afaebe923624a0c96a635299b` |
+| `patches/merlin-engine-v2.5.2/tests/test_0011_commit_graph_reuse.py` | 100644 | 4590 | `cc2c11de452b8a3419b9cbaa89c31a7c80af303a529f6aff47e30984396e395d` |
+| `patches/merlin-engine-v2.5.2/tests/test_0011_metadata_reuse.py` | 100644 | 21743 | `db73c3065b433b498a1984e551fae8b05a379d3348e2d5d05faf877a1b1272e2` |
+| `patches/merlin-engine-v2.5.2/tests/test_0012_guard_idle_quiesce.py` | 100644 | 37678 | `d737394a929256d8bd86f0894f743deee08bb59b3a56d765940d1d0d24a964eb` |
 | `patches/vllm-0.30.0/0001-flashinfer-port-vllm-47979-uniform-multi-token-decode.patch` | 100644 | 9727 | `814748c6674d22217bed4fd5f341e4d3284aaea05a39e818ecc8ec5fed306539` |
 | `patches/vllm-0.30.0/0002-flashinfer-cache-the-decode-plan-when-the-schedule-c.patch` | 100644 | 5160 | `023f3acdd557c3f3ea477c3d6f07921a77c5718735adcf4d8104cec88d7b530f` |
 | `patches/vllm-0.30.0/0003-host-resident-embedding-table-on-by-default.patch` | 100644 | 5927 | `0dd3da2638f524950d066f08ff1d70057caf5c1a39bdf18382b10b9df31e8ec4` |
@@ -34,15 +64,20 @@ manifest too. Checkpoint files are listed in `release/checkpoint.sha256`.
 | `quant/kvcal_write.py` | 100755 | 3954 | `1a24f6f286e07fdc32f95dc68373536b95f027778cac5f516392806b553157ef` |
 | `quant/mtpcal.py` | 100755 | 5554 | `53a05da857d5b804839589c58f5239869fb851d4d88d37fabbbda294abb7199e` |
 | `quant/quantize_head_mtp.py` | 100755 | 13791 | `dfb1b5cbc5a768042a305cb23adff7d413ad17145ca45b42de700445d0cea78e` |
-| `release/checkpoint.sha256` | 100644 | 965 | `0d01f839e46ca586b1c6884eb56c9cd549946c51a8ce5cb71d28ac29418a34b4` |
+| `release/apply-flashinfer-patch.sh` | 100755 | 10673 | `675614025f944854681fa0674eaf94eeac1e927a45fbaaa8de05a3c71a4b6276` |
+| `release/check-tile-proof.sh` | 100755 | 4809 | `5b4d217208211846f726d5f3b640476861659de78685d619911f35ba6f829901` |
+| `release/checkpoint-thinkingcap.sha256` | 100644 | 965 | `a1959d24c09c0beaf18c44f0fd714d7e41302d368476f3f9832c00d8f570cbfe` |
+| `release/checkpoint.sha256` | 100644 | 965 | `59903d80e09f7143bb66ae35331867d9cfdaafc0316cbd61ce271b3b8a760c12` |
 | `release/hash_lock.py` | 100755 | 5975 | `3f02902241e3a50fe03443e1bed47c1d047fc3114599f3662a4e9d1034d890fa` |
-| `release/install-env.sh` | 100755 | 3176 | `521da3c0f92f2ae6ca053cf47fe8222aab4a511b401891e8bed05c4aa4b3686a` |
-| `release/make_manifest.py` | 100755 | 3103 | `1e4c44e8ba35fb8084127266cd47071373536f661cb10ce404167cf229b53f90` |
-| `release/requirements-container-toolkit.txt` | 100644 | 855 | `8353f513392de21fe30e34affa96f883533aff0cc1bb9c5adb227b4f67bb7834` |
-| `release/requirements-pinned.txt` | 100644 | 22321 | `996f0dd41bdcdb1082b9e0f416e565224840b4621e553b4ba2f5b1f29b85e57a` |
+| `release/install-env.sh` | 100755 | 11636 | `daf385e58de8970fefd7c4fd19bbec26aa4d17f5a5f141838ce69c8adafc0ff3` |
+| `release/make_manifest.py` | 100755 | 3221 | `1c6beba56e06d7f9987cf5f456c46b02fe0f22c56e32d4d4b08948f327e6d7cb` |
+| `release/requirements-build-tools.txt` | 100644 | 773 | `a5bce6b39502567f3902fc69844bc802afa14f2f5c56344d3d5f6a7fcad44eb3` |
+| `release/requirements-pinned.txt` | 100644 | 22321 | `82c5609cafab941873fc4b284f9b85c250aab3b07f4c8c98adb1ebbffd9ec507` |
 | `release/requirements-pip.txt` | 100644 | 176 | `04064a5ecb22b4af65078f624c06e62d65b1b74f09f7bb4cd40d06f484466bd5` |
-| `serve/docker-entrypoint.sh` | 100755 | 4427 | `a1ddc34e4a2b180041ad755642af9ee7a47ac691f47f0cedf05c4951b5aecb8e` |
-| `serve/serve-tp4.sh` | 100755 | 4148 | `ce7cc8361c4b42ad246cd8063de5476a734c68dc4d3c362696aba064ac396133` |
-| `serve/serve.sh` | 100755 | 4007 | `ef31458a86f47632661506108d52584dbfe61fe8270a451507494b4b3552ebcd` |
+| `serve/serve-thinkingcap-tp4.sh` | 100755 | 621 | `017202d5fe2dad9e46b3e1592be00bc75eb59ae528fcafc3954e9ce2ee595bec` |
+| `serve/serve-thinkingcap.sh` | 100755 | 604 | `2f0223d1e85a4fe914b2b72b3cd2affb6978956df60ab9008e0d0782b17c556a` |
+| `serve/serve-tp4.sh` | 100755 | 7701 | `c44d7a6cd3aaa19ce6753e9fd3ab2e15bca9951a897f7b29950bea2110be813b` |
+| `serve/serve.sh` | 100755 | 8424 | `29a2fc5e0992c9acf5f52dac989270b854d65bde0335f9d7ae732cf1c748484b` |
 | `serve/templates/NOTICE` | 100644 | 521 | `92f64034f03d9ad3a49e27feb10cf58a823f2e910fd509e548c7070f2ca20d2d` |
 | `serve/templates/froggeric-qwen-v22.5.jinja` | 100644 | 28234 | `e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2` |
+| `upstream/PIN` | 100644 | 840 | `58885230a7f143d0a93b404a3b95dc0985e211d73d0ba4c2d74965198e719053` |

@@ -1,0 +1,37 @@
+diff --git a/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index ce59fb4bbb..c79b9727f9 100644
+--- a/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -479,7 +479,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         )
+         self.disable_tp_for_ba_proj = self.maybe_disable_tp(self.quant_config)
+         # --- GDN in_proj_ba split-K (sm_86, small M): VLLM_GDN_BA_SPLITK ---
+-        self.use_ba_splitk = envs.VLLM_GDN_BA_SPLITK
++        # Dense Qwen3.5 (the 27B) only: Qwen4Exp builds this same layer class and must
++        # keep the stock in_proj_ba GEMM on the shared engine.
++        self.use_ba_splitk = bool(envs.VLLM_GDN_BA_SPLITK) and (
++            vllm_config.model_config.architecture
++            in ("Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration")
++        )
+ 
+         query_key_settings = (self.key_dim, 0, False)
+         value_settings = (self.value_dim, 0, False)
+diff --git a/v1/attention/backends/flashinfer.py b/v1/attention/backends/flashinfer.py
+index b3f9df8971..4152a2b8da 100755
+--- a/v1/attention/backends/flashinfer.py
++++ b/v1/attention/backends/flashinfer.py
+@@ -2788,7 +2788,13 @@ def fast_plan_decode(
+     # >> fa2 ONLY. The SM90/SM100 planners DO read kv_len_arr per request. We are sm_86.
+     # >> Single-entry by design: _plan_info is offsets into a per-wrapper workspace holding
+     #    only the LAST plan. A dict cache would return offsets into overwritten bytes.
+-    if envs.VLLM_FLASHINFER_PLAN_CACHE:
++    # fa2 is enforced, not assumed: FlashInfer 0.6.18 resolves backend="auto" to a
++    # concrete name in the first plan() (always taken above), so anything other than
++    # "fa2" here (fa3, trtllm-gen, cute-dsl, unresolved) bypasses the cache.
++    if (
++        envs.VLLM_FLASHINFER_PLAN_CACHE
++        and getattr(self, "_backend", None) == "fa2"
++    ):
+         _key = (
+             # the wrapper's resolved backend: plan_info layouts differ per backend
+             getattr(self, "_backend", None),

@@ -1,0 +1,213 @@
+diff --git a/config/vllm.py b/config/vllm.py
+index 2538e80730..c5557bd277 100644
+--- a/config/vllm.py
++++ b/config/vllm.py
+@@ -75,6 +75,11 @@ _QWEN4EXP_RECOVERSSM_ARCHS = (
+     "Qwen4ExpMTP",
+ )
+ 
++_DENSE_QWEN35_RECOVERSSM_ARCHS = (
++    "Qwen3_5ForCausalLM",
++    "Qwen3_5ForConditionalGeneration",
++)
++
+ # TODO(rocm): These models are either unsupported by MRV2 or slower with
+ # MRV2 on AMD GPUs.
+ ROCM_DEFAULT_MRV1_ARCHITECTURES = frozenset(
+@@ -3234,6 +3239,18 @@ class VllmConfig:
+                 "--use-replayssm is not supported for architecture "
+                 f"{self.model_config.architecture!r}"
+             )
++        if (
++            self.model_config is not None
++            and self.model_config.architecture in _DENSE_QWEN35_RECOVERSSM_ARCHS
++            and not self.cache_config.use_recoverssm
++        ):
++            logger.warning(
++                "--use-replayssm on dense Qwen3.5 selects GDN RecoverSSM, which "
++                "needs speculative decoding; num_speculative_tokens=0, so the "
++                "stock GDN path is used (as without --use-replayssm)"
++            )
++            self.cache_config.use_replayssm = False
++            return self
+         if (
+             self.model_config is not None
+             and self.model_config.architecture in _QWEN4EXP_RECOVERSSM_ARCHS
+@@ -3256,9 +3273,11 @@ class VllmConfig:
+                 "KimiLinearForCausalLM",
+                 "KimiK3ForConditionalGeneration",
+                 *_QWEN4EXP_RECOVERSSM_ARCHS,
++                *_DENSE_QWEN35_RECOVERSSM_ARCHS,
+             ):
+                 raise ValueError(
+-                    "RecoverSSM is only supported for Kimi-K3 KDA and Qwen4Exp GDN"
++                    "RecoverSSM is only supported for Kimi-K3 KDA, Qwen4Exp GDN "
++                    "and dense Qwen3.5 GDN"
+                 )
+             if self.mamba_config.enable_stochastic_rounding:
+                 raise ValueError(
+@@ -3281,16 +3300,19 @@ class VllmConfig:
+                 # Non-last PP ranks get the accepted counts pp_size steps after
+                 # their verify. Model Runner V2 defers the commit with a
+                 # snapshot of its inputs (RecoverSSMState.detach_step) and
+-                # masks freed rows; only the Qwen4Exp GDN/PLE metadata
++                # masks freed rows; Qwen GDN and Qwen4Exp PLE metadata
+                 # implement that snapshot (Kimi-K3 KDA does not).
+                 if (
+                     self.model_config is None
+                     or self.model_config.architecture
+-                    not in _QWEN4EXP_RECOVERSSM_ARCHS
++                    not in (
++                        *_QWEN4EXP_RECOVERSSM_ARCHS,
++                        *_DENSE_QWEN35_RECOVERSSM_ARCHS,
++                    )
+                 ):
+                     raise ValueError(
+                         "RecoverSSM with pipeline_parallel_size > 1 is supported "
+-                        "only for Qwen4Exp GDN/PLE"
++                        "only for Qwen4Exp GDN/PLE and dense Qwen3.5 GDN"
+                     )
+                 if not self.use_v2_model_runner:
+                     raise ValueError(
+diff --git a/model_executor/models/colqwen3_5.py b/model_executor/models/colqwen3_5.py
+index dabb4885ee..c062850d7b 100644
+--- a/model_executor/models/colqwen3_5.py
++++ b/model_executor/models/colqwen3_5.py
+@@ -132,6 +132,7 @@ class ColQwen3_5Model(
+ 
+     # Mark this as a pooling model so vLLM routes to pooler path
+     is_pooling_model = True
++    supports_replayssm = False
+ 
+     # Override hf_to_vllm_mapper to handle ColQwen3.5 weight naming.
+     # ColPali saves weights as "language_model.*" but vLLM's
+diff --git a/model_executor/models/qwen3_5.py b/model_executor/models/qwen3_5.py
+index f991f05d74..c62e251cd4 100644
+--- a/model_executor/models/qwen3_5.py
++++ b/model_executor/models/qwen3_5.py
+@@ -49,6 +49,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
+     MambaStateDtypeCalculator,
+     MambaStateShapeCalculator,
+ )
++from vllm.model_executor.layers.mamba.recoverssm_utils import uses_recoverssm
+ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     ParallelLMHead,
+     VocabParallelEmbedding,
+@@ -388,7 +389,7 @@ class Qwen3_5ForCausalLMBase(
+     def get_mamba_state_dtype_from_config(
+         cls,
+         vllm_config: "VllmConfig",
+-    ) -> tuple[torch.dtype, torch.dtype]:
++    ) -> tuple[torch.dtype, ...]:
+         return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+             vllm_config.model_config.dtype,
+             vllm_config.cache_config.mamba_cache_dtype,
+@@ -398,7 +399,7 @@ class Qwen3_5ForCausalLMBase(
+     @classmethod
+     def get_mamba_state_shape_from_config(
+         cls, vllm_config: "VllmConfig"
+-    ) -> tuple[tuple[int, int], tuple[int, int]]:
++    ) -> tuple[tuple[int, ...], ...]:
+         parallel_config = vllm_config.parallel_config
+         hf_config = vllm_config.model_config.hf_text_config
+         tp_size = parallel_config.tensor_parallel_size
+@@ -449,7 +450,38 @@ class Qwen3_5ForCausalLMBase(
+ 
+ 
+ class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
+-    pass
++    supports_replayssm = True
++
++    @classmethod
++    def get_mamba_state_dtype_from_config(
++        cls, vllm_config: VllmConfig
++    ) -> tuple[torch.dtype, ...]:
++        dtypes = super().get_mamba_state_dtype_from_config(vllm_config)
++        if uses_recoverssm(
++            vllm_config.cache_config, vllm_config.num_speculative_tokens
++        ):
++            return (*dtypes, torch.float32)
++        return dtypes
++
++    @classmethod
++    def get_mamba_state_shape_from_config(
++        cls, vllm_config: VllmConfig
++    ) -> tuple[tuple[int, ...], ...]:
++        shapes = super().get_mamba_state_shape_from_config(vllm_config)
++        if uses_recoverssm(
++            vllm_config.cache_config, vllm_config.num_speculative_tokens
++        ):
++            hf_config = vllm_config.model_config.hf_text_config
++            return (
++                *shapes,
++                (
++                    hf_config.linear_num_value_heads
++                    // vllm_config.parallel_config.tensor_parallel_size,
++                    vllm_config.num_speculative_tokens + 1,
++                    hf_config.linear_value_head_dim + hf_config.linear_key_head_dim + 1,
++                ),
++            )
++        return shapes
+ 
+ 
+ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
+@@ -471,6 +503,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
+     dummy_inputs=Qwen3VLDummyInputsBuilder,
+ )
+ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid):
++    supports_replayssm = True
+     supports_multimodal_pruning = True
+ 
+     hf_to_vllm_mapper = (
+@@ -606,36 +639,15 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
+ 
+     @classmethod
+     def get_mamba_state_dtype_from_config(
+-        cls,
+-        vllm_config: "VllmConfig",
+-    ) -> tuple[torch.dtype, torch.dtype]:
+-        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+-            vllm_config.model_config.dtype,
+-            vllm_config.cache_config.mamba_cache_dtype,
+-            vllm_config.cache_config.mamba_ssm_cache_dtype,
+-        )
++        cls, vllm_config: VllmConfig
++    ) -> tuple[torch.dtype, ...]:
++        return Qwen3_5ForCausalLM.get_mamba_state_dtype_from_config(vllm_config)
+ 
+     @classmethod
+     def get_mamba_state_shape_from_config(
+-        cls, vllm_config: "VllmConfig"
+-    ) -> tuple[tuple[int, int], tuple[int, int]]:
+-        parallel_config = vllm_config.parallel_config
+-        hf_config = vllm_config.model_config.hf_text_config
+-        tp_size = parallel_config.tensor_parallel_size
+-        num_spec = (
+-            vllm_config.speculative_config.num_speculative_tokens
+-            if vllm_config.speculative_config
+-            else 0
+-        )
+-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+-            tp_size,
+-            hf_config.linear_num_key_heads,
+-            hf_config.linear_num_value_heads,
+-            hf_config.linear_key_head_dim,
+-            hf_config.linear_value_head_dim,
+-            hf_config.linear_conv_kernel_dim,
+-            num_spec,
+-        )
++        cls, vllm_config: VllmConfig
++    ) -> tuple[tuple[int, ...], ...]:
++        return Qwen3_5ForCausalLM.get_mamba_state_shape_from_config(vllm_config)
+ 
+     @classmethod
+     def get_mamba_state_copy_func(cls) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
+@@ -699,6 +711,8 @@ class Qwen3_5_MoeMixtureOfExperts(MixtureOfExperts):
+ class Qwen3_5MoeForConditionalGeneration(
+     Qwen3_5ForConditionalGeneration, Qwen3_5_MoeMixtureOfExperts
+ ):
++    supports_replayssm = False
++
+     # For MoE LoRA weights loading
+     is_3d_moe_weight: bool = True
+ 

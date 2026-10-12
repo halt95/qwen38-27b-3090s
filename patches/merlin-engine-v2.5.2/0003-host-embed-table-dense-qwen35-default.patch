@@ -1,0 +1,126 @@
+diff --git a/envs.py b/envs.py
+index 18cc9067cf..0edb877577 100755
+--- a/envs.py
++++ b/envs.py
+@@ -299,11 +299,9 @@ if TYPE_CHECKING:
+     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
+     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
+     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
+-    # Compile-cache factor (v2 host-embedding work): the pinned-host UVA embedding
+-    # table changes the traced MTP-drafter graph (reads _uva_weight instead of
+-    # embed_tokens.weight). Registered here so envs.compile_factors() keys the
+-    # AOT cache on it; the layer itself still reads os.environ directly.
+-    VLLM_HOST_EMBED_TABLE: bool = False
++    # None selects the family default; explicit values retain exact "1" parsing.
++    # None and False must be distinct compile factors.
++    VLLM_HOST_EMBED_TABLE: bool | None = None
+     VLLM_PLE_OFFLOAD_READY_TIMEOUT: float = 600.0
+     # --- Flash-Next fork knobs (v2.2) --------------------------------
+     # Every name below was read straight from os.environ at its use site, so
+@@ -989,6 +987,17 @@ def _e2_diagnostic_mode(name: str) -> str:
+     return value
+ 
+ 
++def host_embed_table_enabled_for_model(architecture: str) -> bool:
++    """Resolve the single knob with dense Qwen3.5 on and other families off."""
++    setting = __getattr__("VLLM_HOST_EMBED_TABLE")
++    if setting is not None:
++        return setting
++    return architecture in (
++        "Qwen3_5ForCausalLM",
++        "Qwen3_5ForConditionalGeneration",
++    )
++
++
+ environment_variables: dict[str, Callable[[], Any]] = {
+     # ================== Installation Time Env Vars ==================
+     # Target device of vLLM, supporting [cuda (by default),
+@@ -2435,7 +2444,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_USE_V2_MODEL_RUNNER": lambda: maybe_convert_bool(
+         os.getenv("VLLM_USE_V2_MODEL_RUNNER", None)
+     ),
+-    "VLLM_HOST_EMBED_TABLE": lambda: os.getenv("VLLM_HOST_EMBED_TABLE", "") == "1",
++    "VLLM_HOST_EMBED_TABLE": lambda: (
++        None
++        if "VLLM_HOST_EMBED_TABLE" not in os.environ
++        else os.getenv("VLLM_HOST_EMBED_TABLE", "") == "1"
++    ),
+     # Timeout for PLE weight loading and TP worker registration.
+     "VLLM_PLE_OFFLOAD_READY_TIMEOUT": lambda: float(
+         os.getenv("VLLM_PLE_OFFLOAD_READY_TIMEOUT", "600")
+diff --git a/v1/worker/gpu/model_runner.py b/v1/worker/gpu/model_runner.py
+index bc0e37c3d9..46bb259963 100644
+--- a/v1/worker/gpu/model_runner.py
++++ b/v1/worker/gpu/model_runner.py
+@@ -191,6 +191,63 @@ from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
+ logger = init_logger(__name__)
+ 
+ 
++def _host_embed_tables(runner) -> None:
++    """Offload dense Qwen3.5 target and MTP embedding shards after loading."""
++    from vllm import envs
++    from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
++
++    architecture = runner.model_config.architecture
++    if architecture not in (
++        "Qwen3_5ForCausalLM",
++        "Qwen3_5ForConditionalGeneration",
++    ):
++        return
++    if not envs.host_embed_table_enabled_for_model(architecture):
++        return
++    config = runner.model_config.hf_text_config
++    if getattr(config, "tie_word_embeddings", False):
++        raise ValueError("Host embedding requires untied word embeddings")
++
++    roots = [("target", runner.model)]
++    draft_model = getattr(runner.speculator, "model", None)
++    if draft_model is not None and draft_model is not runner.model:
++        roots.append(("draft", draft_model))
++
++    total = 0
++    n_tables = 0
++    for label, root in roots:
++        for name, mod in root.named_modules():
++            if not name.endswith("embed_tokens"):
++                continue
++            p = getattr(mod, "weight", None)
++            if p is None or getattr(p, "_vllm_is_uva_offloaded", False):
++                continue
++            if p.device.type != "cuda":
++                continue
++            if type(mod.quant_method).__name__ != "UnquantizedEmbeddingMethod":
++                raise ValueError("Host embedding requires unquantized embeddings")
++            nbytes = p.numel() * p.element_size()
++            cpu_data = p.detach().to(device="cpu").pin_memory()
++            mod._host_embed_weight = cpu_data
++            p.data = get_accelerator_view_from_cpu_tensor(cpu_data)
++            p._vllm_is_uva_offloaded = True
++            mod.use_fused_embedding = False
++            total += nbytes
++            n_tables += 1
++            logger.info(
++                "host-embed: %s/%s -> pinned host, %.3f GiB",
++                label, name, nbytes / (1024**3),
++            )
++    if total:
++        torch.cuda.empty_cache()
++        logger.info(
++            "HOST-RESIDENT EMBED TABLE: freed %.3f GiB of VRAM on this rank "
++            "across %d table(s)", total / (1024**3), n_tables,
++        )
++    else:
++        raise RuntimeError("Host embedding enabled but no CUDA table was offloaded")
++
++
+ def grammar_invalid_draft_positions(
+     input_batch: InputBatch,
+     grammar_req_ids: list[str],
+@@ -493,6 +550,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     eplb_models_added = self.eplb.maybe_register_speculator(
+                         self.speculator, self.speculative_config, load_dummy_weights
+                     )
++            _host_embed_tables(self)
+         time_after_load = time.perf_counter()
+ 
+         self.model_memory_usage = m.consumed_memory

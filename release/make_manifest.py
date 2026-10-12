@@ -7,8 +7,9 @@ Both are computed from the staged blobs (`git ls-files -s` + `git cat-file blob`
 describe exactly the bytes and modes that get committed, whatever the checkout's line endings.
 
   * PACKAGE-MANIFEST.md lists every staged file except itself and SHA256SUMS, with its Git mode,
-    size in bytes and sha256.
-  * SHA256SUMS covers every staged file except itself, including PACKAGE-MANIFEST.md, so
+    size in bytes and sha256. Nothing else is excluded: whatever is committed is published, so
+    internal notes must be removed from the tree, not hidden from the manifest.
+  * SHA256SUMS covers the same files plus PACKAGE-MANIFEST.md, so
     `sha256sum -c release/SHA256SUMS` from the repository root checks the whole tree.
   * Checkpoint files are not listed here; they are in release/checkpoint.sha256 and are checked
     inside the download directory: `(cd ckpt && sha256sum -c ../release/checkpoint.sha256)`.
@@ -57,7 +58,7 @@ def main() -> int:
     manifest = [
         "# Package manifest",
         "",
-        "Every file in this repository except this manifest and `release/SHA256SUMS`, with its Git",
+        "Every file in the package except this manifest and `release/SHA256SUMS`, with its Git",
         "mode, size in bytes and SHA-256 of the committed bytes. `release/SHA256SUMS` covers this",
         "manifest too. Checkpoint files are listed in `release/checkpoint.sha256`.",
         "",

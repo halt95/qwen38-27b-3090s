@@ -199,7 +199,7 @@ The tile (`FLASHINFER_SM8X_FP8_SMALLQ=cta32`, default on) is switched off by set
 | tile on (shipped) | 826,689 / 960 | 403 s | 2 of 2 ranks | 196 / 200 |
 | tile off | 826,689 / 960 | 397 s | none | 194 / 200 |
 
-Tile on against tile off on identical questions: on-only right 2, off-only right 0 (of 200), exact McNemar p = 0.5. The off boot logged no tile line (0 matching lines). Decode speed with the tile off was not re-measured in this gate; the earlier serving A/B is in the README.
+Tile on against tile off on identical questions: on-only right 2, off-only right 0 (of 200), exact McNemar p = 0.5. The off boot logged no tile line (0 matching lines). Decode speed with the tile off was not re-measured in this gate.
 
 ## 7. Later trees
 

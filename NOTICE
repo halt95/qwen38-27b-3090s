@@ -1,40 +1,89 @@
-Qwen3.8-27B on RTX 3090s
+NOTICE - Qwen3.8-27B v1.3.0 and ThinkingCap (Merlin engine v2.5.2 + the 27B patch series; vLLM fork)
 Copyright 2026 halt95
 
-This repository is licensed under the Apache License, Version 2.0 (see LICENSE).
-It contains, modifies or builds on the following third-party work.
+This repository is licensed under the Apache License, Version 2.0 (see LICENSE). The ThinkingCap checkpoint profile's
+weights are NOT under that licence: they are under the PolyForm Small Business License 1.0.0 plus BottleCap AI's
+personal-use permission (see the ThinkingCap paragraph below and licenses/). Those terms cover the ThinkingCap weights on
+Hugging Face, not this repository's code. It contains, modifies or builds on the following third-party work.
 
-vLLM
-  https://github.com/vllm-project/vllm
-  License: Apache License 2.0. Copyright the vLLM project contributors.
-  patches/vllm-0.30.0/ modifies vLLM 0.30.0 source files (as published on PyPI) and adds one new
-  file, model_executor/layers/mamba/gdn/ba_splitk.py (SPDX-License-Identifier: Apache-2.0).
+The engine this release serves is a modified version of vLLM (https://github.com/vllm-project/vllm), Copyright the vLLM
+project contributors, licensed under the Apache License 2.0: vLLM v0.30.0 (base commit ced6857a, pinned in upstream/PIN)
+as modified by the Merlin engine v2.5.2 and by patches/merlin-engine-v2.5.2/.
 
-vLLM pull request #47979 (author: lucifer1004)
-  https://github.com/vllm-project/vllm/pull/47979
-  An open draft upstream as of 2026-09-26. Patch 0001 ports part of it (uniform multi-token
-  decode with FlashInfer on Ampere) to vLLM 0.30.0. Apache License 2.0, as a contribution to vLLM.
+Merlin engine v2.5.2 (halt95; https://github.com/halt95/qwen38-flash-next-3090s, release v2.5.2; pinned in upstream/PIN)
+is the Flash-Next v2.5.1 engine (vLLM v0.30.0 plus 97 fork commits) plus the guard fix that was series patch 0012 here:
+the VLLM_E2_GUARD_IDLE knob, with which the engine's bounds-guard reader parks with no device work while the engine is
+idle (after a final read of every counter) and resumes with the next request. Not stored in this repository:
+release/install-env.sh builds from the pinned public release assets (the v2.5.2 engine bundle and the v2.2.0
+compiled-artifact tarball, which the user downloads beside the repository) and applies
+patches/merlin-engine-v2.5.2/ to them. License: Apache License 2.0 (the
+repository's LICENSE file, as reported by GitHub's licence API for halt95/qwen38-flash-next-3090s on 2026-10-08).
+Derived from vLLM (Apache License 2.0).
 
-FlashInfer
-  https://github.com/flashinfer-ai/flashinfer
-  License: Apache License 2.0. Installed from PyPI as a dependency; not modified.
+patches/merlin-engine-v2.5.2/ (0001-0011) modifies the engine's vLLM source files and adds new ones; the patches are
+listed in patches/merlin-engine-v2.5.2/README.md. Confirmed: vLLM is Apache-2.0 and the Flash-Next repository declares
+Apache-2.0. The series is distributed here under this repository's Apache License 2.0 for the vLLM and Flash-Next files
+it modifies and the files it adds. Any other third-party code inside the Flash-Next fork was not audited for this notice
+and keeps whatever licence it has. patches/vllm-0.30.0/ (the v1.0.0 series, kept for reference, not used by this
+release) modifies vLLM 0.30.0 source files (as published on PyPI) and adds one new file,
+model_executor/layers/mamba/gdn/ba_splitk.py (SPDX-License-Identifier: Apache-2.0).
 
-compressed-tensors
-  https://github.com/vllm-project/compressed-tensors
-  License: Apache License 2.0. Installed from PyPI as a dependency; used by quant/ to pack the
-  int4 head and drafter codes; not modified.
+FlashInfer (https://github.com/flashinfer-ai/flashinfer), License: Apache License 2.0, is installed from PyPI as a
+dependency (flashinfer-python 0.6.18.post1); release/apply-flashinfer-patch.sh patches it at install time with
+patches/flashinfer-0.6.18.post1/ (the 32-row FP8 verify tile). The patch modifies five FlashInfer files
+(data/csrc/batch_prefill.cu, data/csrc/batch_prefill_paged_kernel_inst.jinja,
+data/include/flashinfer/attention/prefill.cuh, data/include/flashinfer/attention/scheduler.cuh,
+jit/attention/modules.py); the modified files keep their original headers and stay under the Apache License 2.0.
 
-Qwen3.8-27B (base model, Qwen / Alibaba Cloud)
-  https://huggingface.co/Qwen/Qwen3.8-27B
-  License: Apache License 2.0.
+One change is a port of an upstream vLLM pull request, applied under its Apache-2.0 licence and credited to its author
+here: #47979 (lucifer1004; https://github.com/vllm-project/vllm/pull/47979), an open draft upstream as of 2026-09-26.
+Patch 0001 ports part of it (uniform multi-token decode with FlashInfer on Ampere) to vLLM 0.30.0. Apache License 2.0,
+as a contribution to vLLM.
 
-philbert's Qwen3.8-27B AWQ checkpoint (the base of halt95/Qwen3.8-27B-W4A16-Merlin)
-  https://huggingface.co/philbert440/Qwen3.8-27B-W4A16-AWQ
-  License: Apache License 2.0.
+compressed-tensors (https://github.com/vllm-project/compressed-tensors), License: Apache License 2.0, is installed from
+PyPI as a dependency; used by quant/ to pack the int4 head and drafter codes; not modified.
 
-froggeric's Qwen-Fixed-Chat-Templates, v22.5
-  https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates (release v22.5, commit 4ea21db9, 2026-09-03; fetched at revision 855bffc4)
-  License: Apache License 2.0 (declared by the source repository, inherited from Qwen).
-  Vendored unmodified: serve/templates/froggeric-qwen-v22.5.jinja
-  sha256: e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2
-  The underlying template is Qwen's (Alibaba Cloud), Apache-2.0. See serve/templates/NOTICE.
+froggeric's Qwen-Fixed-Chat-Templates, v22.5 (https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates; release v22.5,
+commit 4ea21db9, 2026-09-03; fetched at revision 855bffc4), License: Apache License 2.0 (declared by the source
+repository, inherited from Qwen), is vendored unmodified: serve/templates/froggeric-qwen-v22.5.jinja
+(sha256: e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2). The underlying template is Qwen's (Alibaba
+Cloud), Apache-2.0. See serve/templates/NOTICE.
+
+Model weights are not part of this distribution.
+
+Qwen3.8-27B (base model, and base model of ThinkingCap; Qwen / Alibaba Cloud; https://huggingface.co/Qwen/Qwen3.8-27B):
+License: Apache License 2.0. The Qwen materials inside ThinkingCap remain under it
+(licenses/LICENSE-Apache-2.0-Qwen.txt).
+
+philbert's Qwen3.8-27B AWQ checkpoint (the base of halt95/Qwen3.8-27B-W4A16-Merlin;
+https://huggingface.co/philbert440/Qwen3.8-27B-W4A16-AWQ): License: Apache License 2.0.
+
+ThinkingCap-Qwen3.8-27B (BottleCap AI), the model of the ThinkingCap checkpoint profile
+(https://huggingface.co/bottlecapai/ThinkingCap-Qwen3.8-27B, revision 7891e03; weights identical to d2b4e7a). Our
+quantised derivative: https://huggingface.co/halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin (weights only; not stored in
+this repository). This repository ships its checksums (release/checkpoint-thinkingcap.sha256) and serve wrappers
+(serve/serve-thinkingcap.sh, serve/serve-thinkingcap-tp4.sh), which are Apache-2.0 like the rest of the code.
+License of the weights: PolyForm Small Business License 1.0.0 (https://polyformproject.org/licenses/small-business/1.0.0),
+with BottleCap AI's additional permission for personal, non-commercial use by an individual, free of charge.
+Required Notice: Copyright 2026 BottleCap AI (https://bottlecapai.com)
+The licence files travel with the checkpoint; copies are kept in licenses/: ThinkingCap-LICENSE (BottleCap AI's LICENSE),
+LICENSE-PolyForm-Small-Business-1.0.0.txt, LICENSE-Apache-2.0-Qwen.txt and ThinkingCap-NOTICE (BottleCap AI's NOTICE).
+Commercial use by an organisation that does not qualify as a Small Business under the PolyForm text requires a separate
+licence from BottleCap AI.
+Changes made to ThinkingCap for that checkpoint (recorded here for the Apache-2.0 and PolyForm terms):
+  model.safetensors, model.safetensors.index.json: the language-model body quantised to int4 (AWQ, asymmetric, group 128,
+    compressed-tensors format); the int4 lm_head replaces the 16-bit one.
+  config.json: the quantisation configuration, FP8 KV and head/drafter entries.
+  kv_scales.safetensors: per-layer FP8 E4M3 KV-cache scales (new file, calibrated on the base model).
+  model-mtp.safetensors: the multi-token-prediction drafter in int4 (the 16-bit drafter replaced).
+  tokenizer.json, chat_template.jinja, preprocessor_config.json, video_preprocessor_config.json: not modified from the
+    Qwen3.8-27B files.
+  generation_config.json, tokenizer_config.json: the copies in halt95/Qwen3.8-27B-W4A16-Merlin (re-saved by transformers
+    during quantisation, as in philbert's checkpoint): generation values unchanged; the tokenizer config is re-serialised,
+    with the added tokens in tokenizer.json and the chat template in chat_template.jinja.
+The ThinkingCap name is used only to identify the source model; no endorsement by BottleCap AI is implied.
+
+Credits: Qwen (Qwen3.8-27B), philbert (AWQ int4 base checkpoint), BottleCap AI (ThinkingCap-Qwen3.8-27B), lucifer1004
+(vLLM PR #47979, ported by patch 0001), the vLLM, FlashInfer and compressed-tensors projects, froggeric (chat template),
+aikitoria (P2P driver for consumer Ampere), CoolShades (idle-power report, Flash-Next issue #2, and PR #3, behind the guard
+fix in Merlin engine v2.5.2).
