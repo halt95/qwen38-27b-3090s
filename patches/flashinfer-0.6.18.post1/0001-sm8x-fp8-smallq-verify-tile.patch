@@ -1,6 +1,6 @@
 diff -ruN a/data/csrc/batch_prefill.cu b/data/csrc/batch_prefill.cu
---- a/data/csrc/batch_prefill.cu	2026-10-06 19:29:51.059279100 -0400
-+++ b/data/csrc/batch_prefill.cu	2026-10-08 20:14:22.326081200 -0400
+--- a/data/csrc/batch_prefill.cu	1970-01-01 00:00:00.000000000 +0000
++++ b/data/csrc/batch_prefill.cu	1970-01-01 00:00:00.000000000 +0000
 @@ -67,7 +67,9 @@
        static_cast<IdType*>(kv_indptr.data_ptr()), total_num_rows, batch_size, num_qo_heads,
        num_kv_heads, head_dim_qk, head_dim_vo, page_size, enable_cuda_graph,
@@ -24,8 +24,8 @@ diff -ruN a/data/csrc/batch_prefill.cu b/data/csrc/batch_prefill.cu
    TVM_FFI_ICHECK(status == cudaSuccess)
        << "Failed to calculate prefill workspace size with error: " << cudaGetErrorString(status);
 diff -ruN a/data/csrc/batch_prefill_paged_kernel_inst.jinja b/data/csrc/batch_prefill_paged_kernel_inst.jinja
---- a/data/csrc/batch_prefill_paged_kernel_inst.jinja	2026-10-06 19:29:51.062277700 -0400
-+++ b/data/csrc/batch_prefill_paged_kernel_inst.jinja	2026-10-08 20:14:22.335887600 -0400
+--- a/data/csrc/batch_prefill_paged_kernel_inst.jinja	1970-01-01 00:00:00.000000000 +0000
++++ b/data/csrc/batch_prefill_paged_kernel_inst.jinja	1970-01-01 00:00:00.000000000 +0000
 @@ -9,7 +9,10 @@
     {16} for head_dim_qk >= 512 with a smaller head_dim_vo (o_frag register
     pressure permits only CTA16 there), and {16, 64, 128} otherwise; don't
@@ -39,8 +39,8 @@ diff -ruN a/data/csrc/batch_prefill_paged_kernel_inst.jinja b/data/csrc/batch_pr
      /*CTA_TILE_Q=*/{{cta_tile_q}}, {{head_dim_qk}}, {{head_dim_vo}}, {{pos_encoding_mode}}, {{use_fp16_qk_reduction}}, {{mask_mode}},
      {{ variant_name }}, PagedParams>(PagedParams params, {{ dtype_o }}* tmp_v, float* tmp_s, bool enable_pdl, cudaStream_t stream);
 diff -ruN a/data/include/flashinfer/attention/prefill.cuh b/data/include/flashinfer/attention/prefill.cuh
---- a/data/include/flashinfer/attention/prefill.cuh	2026-10-06 19:29:52.330864900 -0400
-+++ b/data/include/flashinfer/attention/prefill.cuh	2026-10-08 20:14:22.566957400 -0400
+--- a/data/include/flashinfer/attention/prefill.cuh	1970-01-01 00:00:00.000000000 +0000
++++ b/data/include/flashinfer/attention/prefill.cuh	1970-01-01 00:00:00.000000000 +0000
 @@ -294,6 +294,17 @@
    static constexpr bool USE_KV_REPACK = (sizeof(DTypeKV_) == 1) && !is_fp4_type_v<DTypeKV_> &&
                                          (HEAD_DIM_VO != 64) && (HEAD_DIM_VO <= 256) &&
@@ -348,8 +348,8 @@ diff -ruN a/data/include/flashinfer/attention/prefill.cuh b/data/include/flashin
        min(max_smem_per_sm / num_ctas_per_sm, max_smem_per_block_optin);
  
 diff -ruN a/data/include/flashinfer/attention/scheduler.cuh b/data/include/flashinfer/attention/scheduler.cuh
---- a/data/include/flashinfer/attention/scheduler.cuh	2026-10-06 19:29:52.332873700 -0400
-+++ b/data/include/flashinfer/attention/scheduler.cuh	2026-10-08 20:14:22.563919500 -0400
+--- a/data/include/flashinfer/attention/scheduler.cuh	1970-01-01 00:00:00.000000000 +0000
++++ b/data/include/flashinfer/attention/scheduler.cuh	1970-01-01 00:00:00.000000000 +0000
 @@ -22,6 +22,10 @@
  #include <algorithm>
  #include <cstddef>
@@ -609,8 +609,8 @@ diff -ruN a/data/include/flashinfer/attention/scheduler.cuh b/data/include/flash
  
  inline float cost_function(int qo_len, int kv_len) { return 2 * float(qo_len) + kv_len; }
 diff -ruN a/jit/attention/modules.py b/jit/attention/modules.py
---- a/jit/attention/modules.py	2026-10-06 19:29:52.683921000 -0400
-+++ b/jit/attention/modules.py	2026-10-08 20:14:22.365709000 -0400
+--- a/jit/attention/modules.py	1970-01-01 00:00:00.000000000 +0000
++++ b/jit/attention/modules.py	1970-01-01 00:00:00.000000000 +0000
 @@ -396,6 +396,10 @@
          f"use_swa_{use_sliding_window}_"
          f"use_logits_cap_{use_logits_soft_cap}_"

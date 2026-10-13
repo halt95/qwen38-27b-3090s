@@ -4,6 +4,26 @@ Release notes, newest first. To install and run the current release, see the [RE
 (scripts, serve-script variables and knobs, capacity, known behaviours, measurement method) is in
 [docs/reference.md](docs/reference.md); v1.0.0 and its numbers are in [docs/history.md](docs/history.md).
 
+## v1.3.1
+
+Released 2026-10-13. Documentation only: the engine, patch series, serve scripts, pins and both checkpoints are unchanged
+from [v1.3.0](#v130) (the FlashInfer patch file differs only in its diff-header timestamps, so what it applies is
+identical). Install as before, from tag `v1.3.1`.
+
+### What changed in v1.3.1
+
+- **The glibc floor is 2.34, not 2.31.** Two compiled engine libraries in the pinned v2.2.0 artifacts
+  (`vllm/_C_stable_libtorch.abi3.so`, `vllm/_moe_C_stable_libtorch.abi3.so`) need GLIBC_2.34, for example Ubuntu 22.04,
+  Debian 12, RHEL 9 or newer.
+- The ThinkingCap rows in [docs/reference.md](docs/reference.md#thinkingcap-checkpoint-profile) now name the card, date and default effort they were
+  measured at, and the thinking-token ratios are shown as ratios of the paired medians.
+- Removed three lines with no published measurement behind them (an uncapped-image memory note, a v1.0.0 pool note and a
+  boot-log quote) and the reference host's virtualisation detail.
+- The PolyForm Small Business threshold is worded as in the licence, and the NOTICE change record for the ThinkingCap
+  checkpoint matches the one on Hugging Face (the `config.json` re-save, the reused KV scales).
+- Wording in the patch notes and one test docstring; the bench card's cached-token note now says it describes the gate's
+  serve line.
+
 ## v1.3.0
 
 Released 2026-10-12. Dual and quad card only. The single card profile is parked for this release: no single card serve

@@ -32,7 +32,7 @@ written, the same way as the 40 padding rows in the stock 64-row CTA.
 
 Any other plan, in any mode, keeps the stock tile and the stock work order. Every kernel-side
 change is behind `if constexpr (kFp8SmallQ2x2)`, so other instantiations compile to the stock
-kernels: per-kernel SASS of the stock CTA64, CTA16 and merge kernels is identical on desk.
+kernels: per-kernel SASS of the stock CTA64, CTA16 and merge kernels is identical on the build host (nvcc 12.8).
 
 **The knob.** `FLASHINFER_SM8X_FP8_SMALLQ`: unset or `0` = stock, `cta32` = the tile. A third
 value, `cta16`, is a discriminator arm from the microbench (q_len 4 only). It failed its error
@@ -138,7 +138,7 @@ Two cases differ in the per-chunk state a split-KV plan hands to the merge:
   when it is not negligible, i.e. when sm_scale_log2 is close to 1 (at least about 0.997): then the
   merged output differs (the audit's construction at sm_scale_log2 = 1: stock 0.9995, tile 0.80, exact
   1.0). At the 27B's scale the chunk's weight is about 2^-49700 in both arms. In that synthetic cell
-  (every logit about -140 in natural units) the tile is exact (6.4e-13 vs fp64 on the box) and stock
+  (every logit about -140 in natural units) the tile is exact (6.4e-13 vs fp64 on the reference host) and stock
   is not: stock's d = 1, m = -5e4 initial state still carries weight there, and its CTA64 output is off
   by up to 0.055 at TP4. No real row has every logit that far below zero.
 
@@ -180,7 +180,7 @@ scripts, an unset variable also disables the tile. The plan is then the stock he
   Thinking-off at 255K: TP2 77 to 89 tok/s, TP4 124 to 134 tok/s. GSM8K-200: T 195/195/195 vs
   S 194/195/195. The 262K needle passes on TP2 S, TP2 T and TP4 T. These were pre-release serving
   configs (earlier KV pins, no RecoverSSM); the release figures are in the top-level README.
-- **Desk** (nvcc 12.8, sm_86): 244 registers, 0 spills, 98,816 B shared memory. The stock
+- **Build host** (nvcc 12.8, sm_86): 244 registers, 0 spills, 98,816 B shared memory. The stock
   kernels' SASS is unchanged.
 - **Not covered:** the single-card (TP1) arm with K=4 and the tile has not been run, and single
   card is not part of this release. The numerics check is kernel-level (an error budget against
@@ -204,7 +204,7 @@ scripts, an unset variable also disables the tile. The plan is then the stock he
   `check-tile-proof.sh` matches whole lines, requires the engine-start boundary and devices
   0..N-1 once each. `variant.sm_scale_log2` is passed to the KV-warp merge only on the
   kFp8SmallQ2x2 softmax path, so a custom attention variant without that member compiles as on
-  stock (desk nvcc 12.8: such a non-softmax variant fails to compile on the v5 release revision
+  stock (build host, nvcc 12.8: such a non-softmax variant fails to compile on the v5 release revision
   and compiles with this one at CTA 64 and CTA 32; DefaultAttention SASS is identical to the v5
   release revision at CTA 16, 32 and 64). The apply script checks import resolution, locks, and
   patches with `--forward`. The kernel recurrence is unchanged. Changed headers rebuild an

@@ -1,4 +1,4 @@
-NOTICE - Qwen3.8-27B v1.3.0 and ThinkingCap (Merlin engine v2.5.2 + the 27B patch series; vLLM fork)
+NOTICE - Qwen3.8-27B v1.3.1 and ThinkingCap (Merlin engine v2.5.2 + the 27B patch series; vLLM fork)
 Copyright 2026 halt95
 
 This repository is licensed under the Apache License, Version 2.0 (see LICENSE). The ThinkingCap checkpoint profile's
@@ -73,8 +73,10 @@ licence from BottleCap AI.
 Changes made to ThinkingCap for that checkpoint (recorded here for the Apache-2.0 and PolyForm terms):
   model.safetensors, model.safetensors.index.json: the language-model body quantised to int4 (AWQ, asymmetric, group 128,
     compressed-tensors format); the int4 lm_head replaces the 16-bit one.
-  config.json: the quantisation configuration, FP8 KV and head/drafter entries.
-  kv_scales.safetensors: per-layer FP8 E4M3 KV-cache scales (new file, calibrated on the base model).
+  config.json: the quantisation configuration, FP8 KV and head/drafter entries; re-saved by transformers, which adds dtype
+    and vision_config.dtype, sets vision_config.model_type to qwen3_5_vision and updates transformers_version.
+  kv_scales.safetensors: per-layer FP8 E4M3 KV-cache scales (new file: the halt95/Qwen3.8-27B-W4A16-Merlin scales, reused
+    byte for byte; calibrated on philbert's checkpoint, and ThinkingCap's activation maxima fit inside them).
   model-mtp.safetensors: the multi-token-prediction drafter in int4 (the 16-bit drafter replaced).
   tokenizer.json, chat_template.jinja, preprocessor_config.json, video_preprocessor_config.json: not modified from the
     Qwen3.8-27B files.

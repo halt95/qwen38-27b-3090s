@@ -43,7 +43,7 @@ v1.3.0 = Merlin engine v2.5.2 (vLLM 0.30.0 plus the Flash-Next fork's commits an
 
 ## 1. Single stream over context depth
 
-- c1, 3 requests per depth and mode; every request is a cold prefill (a distinct cache salt per request; the harness also records the API's cached-token count, which this serve line does not report, so the cold property rests on the salt).
+- c1, 3 requests per depth and mode; every request is a cold prefill (a distinct cache salt per request; the harness also records the API's cached-token count, which the gate's serve line did not report (the shipped scripts add `--enable-prompt-tokens-details`), so the cold property rests on the salt).
 - **Thinking on:** the harness requests effort `low` with `max_tokens` 256, so short answers finish and long ones hit the cap. **Thinking off:** `enable_thinking` false, `max_tokens` 1,024, `min_tokens` 200.
 - Median ITL = the median over the 3 requests of each request's median interval between streamed chunks (one chunk = one decode step). tokens/step = tokens per streamed chunk. Decode = tokens after the first chunk / time from the first to the last chunk (median of 3); it moves with how many drafted tokens each text accepts, so ITL is the steadier figure.
 - TTFT = median of 3. Prefill = prompt tokens / median TTFT (it includes scheduling).

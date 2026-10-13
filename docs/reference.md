@@ -97,7 +97,7 @@ set `VLLM_API_KEY` in the environment (clients then send `Authorization: Bearer 
 |---|---|---|
 | `SPEC_K` | **4** | MTP draft tokens per step; 3 and 1 are accepted (the measured values), anything else is refused. Capture sizes follow K |
 | `FLASHINFER_SM8X_FP8_SMALLQ` | `cta32` | FlashInfer 32-row verify tile for the MTP verify attention (q_len 4 or 5, i.e. K=3 or 4, fp8 KV, sm_86; other shapes and architectures take the stock path). Set it to the empty string (`FLASHINFER_SM8X_FP8_SMALLQ= serve/serve.sh`; an unset variable gets the default back) to run stock FlashInfer; `0` also turns it off. Only `cta32`, `0` and the empty string are accepted; any other value (for example the benchmark arm `cta16`) is refused with exit 2. Needs the patched FlashInfer |
-| `MAX_PIXELS` | **4194304** | Per-image pixel cap (2048×2048); larger images are downscaled to fit before the vision encoder. Uncapped, a large image can run the encoder out of memory at the TP2 pin (a pre-release probe). At the release gate, on the shipped default, a 16 MP image was downscaled to the cap and answered (HTTP 200, 4,123 prompt tokens, 3.7 s dual card, 2.8 s quad card) and 8 distinct 4 MP images in one prompt answered (HTTP 200, 32,809 prompt tokens, 28.6 s and 19.9 s); the uncapped case was not re-run. Empty = no cap (not recommended). Anything but a plain decimal between 65536 and 33554432 without a leading zero is refused with exit 2. |
+| `MAX_PIXELS` | **4194304** | Per-image pixel cap (2048×2048); larger images are downscaled to fit before the vision encoder. At the release gate, on the shipped default, a 16 MP image was downscaled to the cap and answered (HTTP 200, 4,123 prompt tokens, 3.7 s dual card, 2.8 s quad card) and 8 distinct 4 MP images in one prompt answered (HTTP 200, 32,809 prompt tokens, 28.6 s and 19.9 s); the uncapped case was not re-run. Empty = no cap (not recommended). Anything but a plain decimal between 65536 and 33554432 without a leading zero is refused with exit 2. |
 | `--prefix-match-unit` | 16 (fixed in the scripts) | prefix-cache match granularity; must divide the hybrid KV block (832 at K≤3, 848 at K=4, 960 on dual card with RecoverSSM at K=4) |
 | `LPT` | 832 | `--long-prefill-token-threshold`; `0` removes it |
 | `VLLM_HOST_EMBED_TABLE` | unset = on for the dense Qwen3.5 family | host-resident embedding table; `0` off, `1` explicit |
@@ -112,13 +112,13 @@ set `VLLM_API_KEY` in the environment (clients then send `Authorization: Bearer 
 | | Required | Reference host |
 |---|---|---|
 | GPUs | 2× (dual card) or 4× (quad card) 24 GB sm_86 cards, with no other process on them | RTX 3090 |
-| OS | Linux x86_64 with glibc ≥ 2.31 | Debian 13, glibc 2.41 |
+| OS | Linux x86_64 with glibc ≥ 2.34 (the compiled engine libraries need it) | Debian 13, glibc 2.41 |
 | NVIDIA driver | one that supports CUDA 13.0 | 610.43.02, P2P-enabled |
 | CUDA toolkit | `nvcc` at `/usr/local/cuda` or `$CUDA_HOME`, for FlashInfer's JIT (the tile included) | 13.3 |
 | Python | 3.13, with `venv` | 3.13 |
 | Tools | git, `sha256sum`, GNU `patch`, `flock` (util-linux) | |
 | Disk | about 17 GB (15.9 GiB) for the checkpoint, plus the venv and the engine source tree (`.vllm-v2.5.2`) | |
-| System RAM | **about 2.4 GiB more than a standard vLLM serve**: the token-embedding table lives in pinned host RAM, 1.18 GiB per GPU on dual card or 0.59 on quad card | 192 GB host (152 GiB to the serving LXC guest) |
+| System RAM | **about 2.4 GiB more than a standard vLLM serve**: the token-embedding table lives in pinned host RAM, 1.18 GiB per GPU on dual card or 0.59 on quad card | 192 GB host (152 GiB to the serving environment) |
 | Interconnect | GPU peer-to-peer (P2P): the serve scripts skip vLLM's P2P check and set `NCCL_P2P_LEVEL=SYS`. Without P2P remove those two settings (unmeasured). PCIe Gen4 x16 and P2P were used for every measurement | P2P-enabled driver |
 
 Not yet run outside the reference host: no other GPU, distribution, driver or non-P2P host.
@@ -128,7 +128,7 @@ Not yet run outside the reference host: no other GPU, distribution, driver or no
 BottleCap AI's [ThinkingCap-Qwen3.8-27B](https://huggingface.co/bottlecapai/ThinkingCap-Qwen3.8-27B) is a reasoning
 fine-tune of Qwen3.8-27B that reasons in fewer tokens.
 [halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin](https://huggingface.co/halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin) is our
-W4A16 quantisation of it (revision `7891e03`) in the same 4-bit format as this release's checkpoint: an AWQ int4 body made with
+W4A16 quantisation of it (made from BottleCap's revision `7891e03`) in the same 4-bit format as this release's checkpoint: an AWQ int4 body made with
 philbert's recipe unchanged, plus this release's calibrated FP8 E4M3 KV scales, int4 `lm_head` and int4 MTP drafter, reused byte
 for byte (ThinkingCap's `lm_head`, embeddings and MTP head are bit-identical to the base's, and its KV activation maxima fit
 inside the base's scales and their 1.10 calibration margin). `tokenizer.json` is the upstream file; 11
@@ -153,8 +153,8 @@ in [NOTICE](../NOTICE).
 [ThinkingCap bench card](../benchmarks/2026-10-12/ThinkingCap-BENCH-CARD.md)):
 
 - **Thinking length** (GSM8K, the same items for both arms, per-item seeds, paired against this release's checkpoint): at
-  medium effort (1,319 items) x0.860 of the base's median thinking tokens (95 % CI 0.840-0.879; mean 205.9 to 170.2) at 97.27 %
-  accuracy for both (non-inferior within 2 pp, p = 0.001); at `xhigh` (400 items) x0.579 (0.533-0.625; mean 458.4 to 176.4) at
+  medium effort (1,319 items) x0.860 of the base's median thinking tokens (paired medians 157 to 135, 95 % CI 0.840-0.879; means 205.9 to 170.2) at 97.27 %
+  accuracy for both (non-inferior within 2 pp, p = 0.001); at `xhigh` (400 items) x0.579 (medians 140 to 81, 95 % CI 0.533-0.625; means 458.4 to 176.4) at
   97.75 % against 96.75 % (a report-only cell). No answer in this paired run was cut at the token cap. One task family (arithmetic word problems);
   the saving on code, long-context or agentic work was not measured.
 - **Decode, dual card:** the median decode step equals the base checkpoint's within 1 % at 4K to 255K (20.0 / 21.5 / 25.4 /
@@ -170,11 +170,11 @@ in [NOTICE](../NOTICE).
   agent sessions ran at 156.6 and 148.3 tok/s effective.
 - **Eight agents at once (2026-10-12):** eight concurrent replays of those agent sessions: 215.7 tok/s total output on dual
   card (28.1 tok/s per agent, median) and 333.5 tok/s on quad card (42.6 per agent, median), prefix-cache hit 95.4 %, 0 errors.
-- **Capacity and gates:** the pools as pinned (826,689 tokens dual, 1,974,072 quad); three 261,600-token or six 130,800-token
-  sessions resident on dual card and seven 261,600-token sessions on quad card, all with 0 preemptions; the 262K needle passed;
-  an 8-conversation load of 206 requests with 0 errors. On the shipped engine and scripts at the `xhigh` default (2026-10-11):
+- **Capacity and gates:** the pools as pinned (826,689 tokens dual, 1,974,072 quad). Dual card at the 2026-10-08 gate (the
+  Qwen3.8-27B `serve.sh` with its medium default): three 261,600-token or six 130,800-token sessions resident with 0
+  preemptions; the 262K needle passed; an 8-conversation load of 206 requests with 0 errors. On the shipped engine and scripts at the `xhigh` default (2026-10-11):
   GSM8K-200 195 of 200 with 3 answers cut at the token cap, needle passed, loop gate 0 genuine collapses in 72 generations,
-  6 of which ended at the length cap. Quad card (2026-10-09, `xhigh`):
+  6 of which ended at the length cap. Quad card (2026-10-09, `xhigh`): seven 261,600-token sessions resident with 0 preemptions,
   GSM8K-200 193 of 200, 0 genuine collapses. Quad card on the shipped tree (2026-10-12): 262K needle passed (180 s); the
   8-conversation load ran 443 requests with 0 errors, 96.5 % prefix-cache hit rate and 0 preemptions.
 
@@ -250,7 +250,7 @@ measurements include both. Sampling is pinned server-side (temperature 1.0, top-
 repetition penalty); a request can still override it. Boots log lines that are not failures, for example
 `SymmMemCommunicator: Device capability 8.6 not supported`, `Enabling num_speculative_tokens > 1 will run multiple
 times of forward on same MTP layer` and a note that the model config asks for an fp32 Mamba SSM dtype while
-`--mamba-ssm-cache-dtype='float16'` was passed (fp16 is the measured choice). The v1.3.0 gate boot logs also carry, without a failure: `Add 3 padding layers, may waste at most 6.25% KV cache memory`; `max_num_scheduled_tokens is set to 2048 based on the speculative decoding settings`;
+`--mamba-ssm-cache-dtype='float16'` was passed (fp16 is the measured choice). The v1.3.0 gate boot logs also carry, without a failure: `max_num_scheduled_tokens is set to 2048 based on the speculative decoding settings`;
 `FlashInfer All Reduce is disabled because it is not supported for world_size=2` (4 on quad card); `Unknown vLLM environment variable detected: VLLM_ATTENTION_BACKEND` (the serve scripts set it); a note that the checkpoint's `generation_config.json` overrides vLLM's default sampling parameters; a `VLLM_E2_PLE_PULL_TRANSPORT is enabled, but this rank owns no PLE layer` line; and `Triton kernel JIT compilation during inference` for the sampler kernels on the first requests.
 
 ## What is in v1.3.0
@@ -331,8 +331,8 @@ cache key; three runtime switches are left out of it on purpose, because nothing
 | GPU | 4× NVIDIA GeForce RTX 3090 (Ampere sm_86, 24 GB each), **220 W** power cap, no NVLink; dual card uses one pair |
 | PCIe | Gen4 x16 to every card; P2P over [aikitoria's open-kernel-module patch](https://github.com/aikitoria/open-gpu-kernel-modules) (driver 610.43.02; `VLLM_SKIP_P2P_CHECK=1`, `NCCL_P2P_LEVEL=SYS`) |
 | CPU | AMD EPYC 7532, 32 cores / 64 threads |
-| RAM | 192 GB DDR4-2933 ECC (6 × 32 GB); the serving LXC guest sees 152 GiB |
-| OS / serving | Debian 13 LXC guest on Proxmox, CUDA toolkit 13.3; the scripts here run the same engine directly |
+| RAM | 192 GB DDR4-2933 ECC (6 × 32 GB); the serving environment sees 152 GiB |
+| OS / serving | Debian 13, CUDA toolkit 13.3; the scripts here run the same engine directly |
 
 ### The KV budget
 
@@ -347,8 +347,7 @@ cache key; three runtime switches are left out of it on purpose, because nothing
 | Sessions resident, 0 preemptions | 3 × 262K or 6 × 131K | 7 × 262K |
 
 The pins are whole numbers of pool blocks, so no bytes are wasted. The earlier pins (14,534,914,979 and 17,832,100,834
-bytes, the v1.0.0 K=3 pins) are not whole numbers of K=4 pool blocks, and on dual card they left the pool short of three
-full 262K sessions once the reserved null block is counted, so the pool preempted. The release gate booted the shipped pins (14,756,413,440 and 18,231,050,240 B, 883 and 2,470 whole blocks) and logged exactly
+bytes, the v1.0.0 K=3 pins) are not whole numbers of K=4 pool blocks. The release gate booted the shipped pins (14,756,413,440 and 18,231,050,240 B, 883 and 2,470 whole blocks) and logged exactly
 826,689 and 1,974,072 tokens with blocks of 960 and 848. The serve scripts
 pin the KV allocation in bytes (`KV_BYTES`), so the pool is the same on every boot; at a given pin the pool depends on
 `SPEC_K` (the figures above are K=4). `KV_BYTES=auto`

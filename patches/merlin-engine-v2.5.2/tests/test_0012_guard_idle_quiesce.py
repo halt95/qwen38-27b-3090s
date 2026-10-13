@@ -594,7 +594,7 @@ def test_wait_idle_is_false_without_a_live_gate(make):
 
 def _gpu_runs() -> bool:
     """A CUDA device this torch build can run kernels on (skip, not fail, on
-    e.g. an sm_50 desk card under a build without sm_50 kernels)."""
+    e.g. an sm_50 card under a build without sm_50 kernels)."""
     if not torch.cuda.is_available():
         return False
     try:

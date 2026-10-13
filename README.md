@@ -19,14 +19,15 @@ BottleCap AI's reasoning fine-tune in the same format. Both run on **Merlin engi
 Flash-Next fork commits and the guard fix) with the 27B patch series `patches/merlin-engine-v2.5.2/` (0001-0011) and a
 FlashInfer 32-row verify tile: int4 weights, int4 `lm_head` and drafter, FP8 E4M3 KV, MTP with K=4 draft tokens per
 step, fp16 SSM state, and hash-checked install and serve scripts. Bare metal only; validated on sm_86 (Ampere) only.
-The current release is **v1.3.0** (2026-10-12; see [What's new](#whats-new-in-v130)).
+The current release is **v1.3.1** (2026-10-13): documentation fixes on v1.3.0 ([CHANGELOG](CHANGELOG.md#v131)); see
+[What's new in v1.3.0](#whats-new-in-v130).
 
 ## Models
 
 | Checkpoint | What it is | Default reasoning effort | Weights and licence | Serve scripts (dual / quad card) | Headline numbers |
 |---|---|---|---|---|---|
-| **Qwen3.8-27B** | philbert's AWQ int4 build of Qwen3.8-27B with an int4 GPTQ `lm_head`, an int4 MTP drafter head and calibrated FP8 E4M3 KV scales; 11 files, about 17 GB | `medium` | [halt95/Qwen3.8-27B-W4A16-Merlin](https://huggingface.co/halt95/Qwen3.8-27B-W4A16-Merlin), Apache-2.0 | `serve/serve.sh` / `serve/serve-tp4.sh` | Single-stream thinking decode at 32K: 198 tok/s dual card, 249 quad card; GSM8K-200 196 and 194 (release gate, 2026-10-08 to 2026-10-09 (UTC)) |
-| **ThinkingCap** | BottleCap AI's reasoning fine-tune of Qwen3.8-27B, which reasons in fewer tokens; our W4A16 quantisation of it in the same format; 11 files, about 17 GB | `xhigh` | [halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin](https://huggingface.co/halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin), PolyForm Small Business 1.0.0 plus BottleCap AI's personal-use permission ([License](#license)) | `serve/serve-thinkingcap.sh` / `serve/serve-thinkingcap-tp4.sh` | x0.860 of the base's median thinking tokens at medium effort, at the same GSM8K accuracy (97.27 %, 1,319 items); 172.8 tok/s at 32K on dual card (2026-10-08 gate) and 223.4 on quad card (2026-10-12) |
+| **Qwen3.8-27B** | philbert's AWQ int4 build of Qwen3.8-27B with an int4 GPTQ `lm_head`, an int4 MTP drafter head and calibrated FP8 E4M3 KV scales; 11 checkpoint files, about 17 GB | `medium` | [halt95/Qwen3.8-27B-W4A16-Merlin](https://huggingface.co/halt95/Qwen3.8-27B-W4A16-Merlin), Apache-2.0 | `serve/serve.sh` / `serve/serve-tp4.sh` | Single-stream thinking decode at 32K: 198 tok/s dual card, 249 quad card; GSM8K-200 196 and 194 (release gate, 2026-10-08 to 2026-10-09 (UTC)) |
+| **ThinkingCap** | BottleCap AI's reasoning fine-tune of Qwen3.8-27B, which reasons in fewer tokens; our W4A16 quantisation of it in the same format; 11 checkpoint files, about 17 GB | `xhigh` | [halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin](https://huggingface.co/halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin), PolyForm Small Business 1.0.0 plus BottleCap AI's personal-use permission ([License](#license)) | `serve/serve-thinkingcap.sh` / `serve/serve-thinkingcap-tp4.sh` | x0.860 of the base's median thinking tokens at medium effort, at the same GSM8K accuracy (97.27 %, 1,319 items); 172.8 tok/s at 32K on dual card (2026-10-08 gate) and 223.4 on quad card (2026-10-12) |
 
 Both checkpoints run on the same engine, patch series, pins, port and served name (`qwen38-27b`); the ThinkingCap
 scripts change only the default reasoning effort. ThinkingCap is an independent quantised derivative: it is **not**
@@ -40,7 +41,7 @@ published, reviewed or endorsed by BottleCap AI or Qwen.
   1.78 s on quad card, against 22.9 s and 15.3 s for the first turn. Eight agents at once on the ThinkingCap checkpoint (2026-10-12):
   215.7 tok/s total output on dual card and 333.5 tok/s on quad card, prefix-cache hit 95.4 %, 0 errors. Every response
   reports its cached prompt tokens.
-- **Fast.** Single-stream thinking decode 206 / 198 / 172 / 144 tok/s at 4K / 32K / 128K / 255K on dual card and
+- **Fast.** Qwen3.8-27B single-stream thinking decode 206 / 198 / 172 / 144 tok/s at 4K / 32K / 128K / 255K on dual card and
   258 / 249 / 238 / 226 on quad card, with MTP K=4 and the FlashInfer 32-row verify tile.
 - **Fewer thinking tokens when you want them.** On GSM8K the ThinkingCap checkpoint used x0.860 of the base's median
   thinking tokens at medium effort (same accuracy) and x0.579 at `xhigh`, on the same engine and pins.
@@ -69,7 +70,7 @@ P2P and ITL are explained in the [Glossary](docs/reference.md#glossary).
 - About 2.4 GiB more host RAM than a standard vLLM serve (the token-embedding table lives in pinned host RAM: 1.18 GiB per
   GPU on dual card, 0.59 on quad card), and disk for one checkpoint (about 17 GB, 15.9 GiB) plus the venv and the engine
   source tree.
-- Linux x86_64 with glibc 2.31 or newer, an NVIDIA driver that supports CUDA 13.0, a CUDA toolkit with `nvcc` (for
+- Linux x86_64 with glibc 2.34 or newer (the compiled engine libraries need it), an NVIDIA driver that supports CUDA 13.0, a CUDA toolkit with `nvcc` (for
   FlashInfer's JIT, the tile included), Python 3.13 with `venv`, git, `sha256sum`, GNU `patch` and `flock` (util-linux).
 
 The full table, with the reference host: [Requirements](docs/reference.md#requirements).
@@ -79,7 +80,7 @@ The full table, with the reference host: [Requirements](docs/reference.md#requir
 Steps 1 and 2 are the same for both checkpoints; step 3 picks one.
 
 ```bash
-git clone --branch v1.3.0 https://github.com/halt95/qwen38-27b-3090s && cd qwen38-27b-3090s
+git clone --branch v1.3.1 https://github.com/halt95/qwen38-27b-3090s && cd qwen38-27b-3090s
 sha256sum -c release/SHA256SUMS                          # the repository files
 # 1. the two engine assets named in upstream/PIN (bundle= and artifacts_tar=): the Merlin engine v2.5.2 bundle and the
 #    v2.2.0 compiled-artifact tarball, both public GitHub release assets. Download them into the clone's PARENT directory
@@ -275,8 +276,8 @@ bases. The ThinkingCap checkpoint `halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin` 
 **Licence of the ThinkingCap weights.** ThinkingCap is licensed by BottleCap AI under the
 [PolyForm Small Business License 1.0.0](https://polyformproject.org/licenses/small-business/1.0.0), plus BottleCap AI's
 additional permission for personal, non-commercial use by an individual, free of charge. A business may use it only if it
-qualifies as a "Small Business" under the PolyForm text (fewer than 100 people and under US$1 million in prior-year
-revenue, inflation adjusted); any other commercial use needs a separate licence from BottleCap AI. **There is no
+qualifies as a "Small Business" under the PolyForm text (fewer than 100 employees and independent contractors in
+total, and under US$1 million in prior-year revenue, in 2019 dollars adjusted for inflation); any other commercial use needs a separate licence from BottleCap AI. **There is no
 unrestricted commercial use.** Required Notice: Copyright 2026 BottleCap AI (https://bottlecapai.com). These terms cover
 the ThinkingCap weights on Hugging Face, which carry the licence files; they do not cover this repository's code, which
 stays Apache-2.0. Copies of BottleCap AI's `LICENSE` and `NOTICE`, the PolyForm text and Qwen's Apache-2.0 text are in

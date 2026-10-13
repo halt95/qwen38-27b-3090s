@@ -1,6 +1,6 @@
 # Release history
 
-Earlier release material, moved here from the [README](../README.md). The current release is v1.3.0; its notes are in
+Earlier release material, moved here from the [README](../README.md). The current release is v1.3.1 (documentation fixes on v1.3.0); its notes are in
 [CHANGELOG.md](../CHANGELOG.md#v130) and its numbers in [reference.md](reference.md#benchmarks).
 
 ## The releases in brief (v1.3.0, v1.1.0, v1.0.0)
@@ -48,6 +48,7 @@ engine. The earlier three-patch build that v1.0.0 was compared against has its o
 ## v1.0.0 quality
 
 - **Paired GSM8K-1319** (previous engine): dual card against the earlier three-patch build, and quad card against dual
-  card, both passed a non-inferiority margin fixed before the run.
-- **Repetition loops:** v1.0.0 saw 0 genuine collapses in 108 long generations and 0 in 504 on earlier builds (counts and
+  card, both passed a non-inferiority margin fixed before the run (figures in the
+  [v1.0.0 README](https://github.com/halt95/qwen38-27b-3090s/blob/v1.0.0/README.md)).
+- **Repetition loops:** v1.0.0 saw 0 genuine collapses in 108 generations and 0 in 504 on earlier builds (counts and
   protocol: [`loop-check.md`](loop-check.md)).
